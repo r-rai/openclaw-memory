@@ -1,0 +1,21 @@
+# Publish guide (contains sensitive auth info)
+PUBLISH.md
+
+# Dependencies (committed pre-built dist is enough)
+node_modules/
+
+# Build output (dist is committed)
+packages/*/dist/*.map
+packages/*/dist/*.js.map
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Environment
+.env
+.env.local
