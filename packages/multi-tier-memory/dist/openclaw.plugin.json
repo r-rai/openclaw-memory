@@ -1,0 +1,26 @@
+{
+  "id": "multi-tier-memory",
+  "name": "Multi-Tier Memory",
+  "description": "Three-tier memory plugin: Redis hot-cache + Qdrant cold vectors + llama.cpp embeddings. Supplies memory_search, memory_get, memory_store, and memory_cache_update tools.",
+  "version": "1.0.0",
+  "activation": {
+    "onStartup": true
+  },
+  "kind": "tool",
+  "contracts": {
+    "tools": ["memory_search", "memory_get", "memory_store", "memory_cache_update"]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "redisUrl": { "type": "string", "default": "redis://redis:6379" },
+      "qdrantUrl": { "type": "string", "default": "http://qdrant:6333" },
+      "embeddingUrl": { "type": "string", "default": "http://llama-cpp:8080/v1" },
+      "embeddingModel": { "type": "string", "default": "nomic-embed-text-v1.5" },
+      "vectorSize": { "type": "integer", "default": 768 },
+      "hotTtlSeconds": { "type": "integer", "default": 3600 },
+      "coldCollection": { "type": "string", "default": "agent_memory" }
+    }
+  }
+}

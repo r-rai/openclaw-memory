@@ -1,0 +1,35 @@
+{
+  "name": "@openclaw-memory/task-event-bus",
+  "version": "1.0.0",
+  "description": "Redis-backed unified task queue and event bus for OpenClaw agents",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "openclaw-task-worker": "./dist/worker.js"
+  },
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./worker": "./dist/worker.js"
+  },
+  "main": "./dist/index.js",
+  "openclaw": {
+    "extensions": ["./dist/index.js"]
+  },
+  "peerDependencies": {
+    "openclaw": ">=1.0.0"
+  },
+  "dependencies": {
+    "redis": "^4.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "clean": "rm -rf dist"
+  },
+  "files": ["dist/", "src/", "openclaw.plugin.json", "README.md"]
+}

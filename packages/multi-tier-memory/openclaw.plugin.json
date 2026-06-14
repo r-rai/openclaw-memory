@@ -1,0 +1,41 @@
+{
+  "$schema": "https://docs.openclaw.ai/schema/pluginManifest.json",
+  "name": "multi-tier-memory",
+  "version": "1.0.0",
+  "description": "Three-tier memory plugin: Redis (hot) + Qdrant (cold vector) + llama.cpp embeddings for OpenClaw agents",
+  "author": "Ravi Rai",
+  "license": "MIT",
+  "openclaw": {
+    "extensions": ["./dist/index.js"]
+  },
+  "config": {
+    "redisUrl": {
+      "type": "string",
+      "default": "redis://redis:6379"
+    },
+    "qdrantUrl": {
+      "type": "string",
+      "default": "http://qdrant:6333"
+    },
+    "embeddingUrl": {
+      "type": "string",
+      "default": "http://llama-cpp:8080/v1"
+    },
+    "embeddingModel": {
+      "type": "string",
+      "default": "nomic-embed-text-v1.5.Q4_K_M.gguf"
+    },
+    "vectorSize": {
+      "type": "integer",
+      "default": 768
+    },
+    "hotTtlSeconds": {
+      "type": "integer",
+      "default": 3600
+    },
+    "coldCollection": {
+      "type": "string",
+      "default": "agent_memory"
+    }
+  }
+}

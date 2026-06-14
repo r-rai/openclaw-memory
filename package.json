@@ -1,0 +1,17 @@
+{
+  "name": "@openclaw-memory/workspace",
+  "version": "1.0.0",
+  "private": true,
+  "description": "OpenClaw memory and task infrastructure plugins",
+  "license": "MIT",
+  "scripts": {
+    "build": "pnpm --filter './packages/**' run build",
+    "clean": "pnpm --filter './packages/**' run clean"
+  },
+  "packages": [
+    "packages/*"
+  ],
+  "devDependencies": {
+    "pnpm": "^9.0.0"
+  }
+}

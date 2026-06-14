@@ -1,0 +1,29 @@
+{
+  "id": "task-event-bus",
+  "name": "Task & Event Bus",
+  "description": "Redis-backed unified task queue and event bus. event_publish/subscribe for pub/sub between agents. task_dispatch/subscribe/results for async task processing. Workers are standalone processes; agents dispatch tasks and poll for results.",
+  "version": "1.0.0",
+  "activation": {
+    "onStartup": true
+  },
+  "kind": "tool",
+  "contracts": {
+    "tools": [
+      "event_publish",
+      "event_subscribe",
+      "task_dispatch",
+      "task_subscribe",
+      "task_results"
+    ]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "redisUrl": { "type": "string", "default": "redis://redis:6379" },
+      "resultTtlMs": { "type": "integer", "default": 300000 },
+      "channelPrefix": { "type": "string", "default": "teb" },
+      "queuePrefix": { "type": "string", "default": "tasks" }
+    }
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "name": "@openclaw-memory/multi-tier-memory",
+  "version": "1.0.0",
+  "description": "Three-tier memory plugin: Redis (hot) + Qdrant (cold) + llama.cpp embeddings for OpenClaw agents",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "openclaw": {
+    "extensions": ["./dist/index.js"]
+  },
+  "peerDependencies": {
+    "openclaw": ">=1.0.0"
+  },
+  "dependencies": {
+    "@qdrant/js-client-rest": "^1.18.0",
+    "redis": "^4.6.0",
+    "typebox": "^1.1.39"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0"
+  },
+  "scripts": {
+    "build": "node --experimental-vm-modules scripts/build.mjs",
+    "clean": "rm -rf dist"
+  },
+  "files": ["dist/", "src/", "openclaw.plugin.json", "README.md"]
+}

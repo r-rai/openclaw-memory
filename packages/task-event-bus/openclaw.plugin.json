@@ -1,0 +1,29 @@
+{
+  "$schema": "https://docs.openclaw.ai/schema/pluginManifest.json",
+  "name": "task-event-bus",
+  "version": "1.0.0",
+  "description": "Redis-backed unified task queue and event bus for OpenClaw agents. Publish/subscribe + async task dispatch with a persistent worker container.",
+  "author": "Ravi Rai",
+  "license": "MIT",
+  "openclaw": {
+    "extensions": ["./dist/index.js"]
+  },
+  "config": {
+    "redisUrl": {
+      "type": "string",
+      "default": "redis://redis:6379"
+    },
+    "resultTtlMs": {
+      "type": "integer",
+      "default": 300000
+    },
+    "channelPrefix": {
+      "type": "string",
+      "default": "teb"
+    },
+    "queuePrefix": {
+      "type": "string",
+      "default": "tasks"
+    }
+  }
+}
