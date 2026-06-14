@@ -19,7 +19,7 @@
   },
   "dependencies": {
     "@qdrant/js-client-rest": "^1.18.0",
-    "redis": "^4.6.0",
+    "redis": "^6.0.0",
     "typebox": "^1.1.39"
   },
   "devDependencies": {
