@@ -243,6 +243,7 @@ OpenClaw gateway and the task worker both resolve these via Docker DNS.
 ## Performance Notes
 
 - Redis `brpop` is O(1) — queue depth has no impact on pop speed. The worker loop optimizes pops by checking priority queues with non-blocking `zPopMin` first, then utilizing a single blocking multi-key `brPop` call for the lower priority queues to minimize CPU polling overhead.
+- Dynamic Queue Auto-Discovery: The plugin dynamically registers queue names in a Redis Set registry (`tasks:registry`) on task dispatch, and the worker periodically (every 15s) queries this registry to update its active queues dynamically without restarts.
 - Redis search uses `mGet` to batch text matching queries instead of calling Redis sequentially, reducing round-trips.
 - Qdrant collection initialization utilizes a promise-lock to prevent concurrent schema creation race conditions during initialization.
 - Qdrant search is O(n) for the collection size — `agent_memory` stays lean by only storing `importance ≥ 0.7` entries

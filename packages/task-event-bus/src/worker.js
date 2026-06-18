@@ -262,12 +262,48 @@ async function processTask(task) {
   }
 }
 
+let lastQueueRefresh = 0;
+const REFRESH_INTERVAL_MS = 15000;
+
+async function refreshQueues() {
+  const now = Date.now();
+  if (now - lastQueueRefresh < REFRESH_INTERVAL_MS) {
+    return;
+  }
+  lastQueueRefresh = now;
+
+  try {
+    const registryKey = `${CONFIG.queuePrefix}:registry`;
+    const registered = await redis.sMembers(registryKey);
+
+    // Baseline queues from env config
+    const envQueues = (process.env.TEB_QUEUES ?? 'general,code,qa,research,ui')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    // Merge baseline and dynamically registered queues
+    const allQueues = Array.from(new Set([...envQueues, ...registered]));
+
+    const prevStr = CONFIG.queues.sort().join(',');
+    const newStr = allQueues.sort().join(',');
+    if (prevStr !== newStr) {
+      CONFIG.queues = allQueues;
+      LOG.info(`Dynamically updated queues list: ${CONFIG.queues.join(', ')}`);
+    }
+  } catch (err) {
+    LOG.error(`Failed to refresh queues from Redis:`, err.message);
+  }
+}
+
 async function run() {
   await initRedis();
+  await refreshQueues();
   LOG.info(`Listening on queues: ${CONFIG.queues.join(', ')}`);
 
   while (true) {
     try {
+      await refreshQueues();
       const task = await claimTask();
       if (task) {
         await processTask(task);

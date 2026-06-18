@@ -137,6 +137,13 @@ services:
 > For security, the `code-run` task handler (which executes shell commands) is **disabled by default**. Setting `TEB_ALLOW_CODE_RUN: "true"` exposes the host/container to command execution. Ensure the worker is isolated and appropriate restrictions are configured.
 ```
 
+### Dynamic Queue Auto-Discovery
+
+The worker dynamically discovers queues as tasks are dispatched. When an agent calls `task_dispatch` to any queue name, the plugin automatically registers that queue in a Redis Set registry (`{queuePrefix}:registry`, e.g., `tasks:registry`). 
+
+The worker periodically queries this registry (every 15 seconds) and dynamically merges the newly registered queues with the baseline list defined by `TEB_QUEUES` (or `--queues` flag). This eliminates the need to update environment variables or restart the worker container when adding new agent queues.
+
+
 ### Built-in task handlers
 
 | Type | Description |

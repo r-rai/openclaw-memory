@@ -265,6 +265,10 @@ class TaskEventBusPlugin {
       // Initialize result as pending
       await client.setEx(resultKey, ttl, JSON.stringify({ status: 'pending', correlationId: id }));
 
+      // Dynamically register the queue in the Redis registry Set
+      const registryKey = `${this.queuePrefix}:registry`;
+      await client.sAdd(registryKey, queue);
+
       return { correlationId: id, queue, priority, dispatchedAt: task.createdAt };
     } catch (err) {
       return { error: err.message };
