@@ -36,6 +36,30 @@ pnpm add @openclaw-memory/task-event-bus
 }
 ```
 
+### Plugin Configuration
+
+You can configure the plugin in `openclaw.json`:
+
+```json
+{
+  "task-event-bus": {
+    "redisUrl": "redis://redis:6379",
+    "resultTtlMs": 300000,
+    "channelPrefix": "teb",
+    "queuePrefix": "tasks",
+    "resultPrefix": "teb:result"
+  }
+}
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `redisUrl` | `redis://redis:6379` | Redis connection URL |
+| `resultTtlMs` | `300000` | TTL for task results in Redis (in milliseconds) |
+| `channelPrefix` | `teb` | Redis key prefix for event pub/sub channels |
+| `queuePrefix` | `tasks` | Redis key prefix for task queues |
+| `resultPrefix` | `teb:result` | Redis key prefix for task results (must match the worker's `TEB_RESULT_PREFIX`) |
+
 ## Event Bus
 
 ### Publish an event
@@ -97,8 +121,10 @@ services:
     environment:
       TEB_REDIS_URL: "redis://redis:6379"
       TEB_QUEUE_PREFIX: "tasks"
+      TEB_RESULT_PREFIX: "teb:result"
       TEB_RESULT_TTL: "300"
       TEB_QUEUES: "general,code,qa,research,ui"
+      TEB_ALLOW_CODE_RUN: "false" # MUST be set to "true" to enable code-run tasks
       TEB_LOG_LEVEL: "info"
     volumes:
       - "/path/to/task-event-bus/dist:/app/worker/dist:ro"
@@ -106,14 +132,17 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+
+> [!WARNING]
+> For security, the `code-run` task handler (which executes shell commands) is **disabled by default**. Setting `TEB_ALLOW_CODE_RUN: "true"` exposes the host/container to command execution. Ensure the worker is isolated and appropriate restrictions are configured.
 ```
 
 ### Built-in task handlers
 
 | Type | Description |
 |------|-------------|
-| `code-run` | Execute a shell command, capture stdout/stderr |
-| `web-fetch` | HTTP GET/POST, return status + body |
+| `code-run` | Execute a shell command, capture stdout/stderr. **Disabled by default (requires `TEB_ALLOW_CODE_RUN: "true"` in environment to enable).** |
+| `web-fetch` | HTTP GET/POST, return status + body. Supports configurable `timeoutSeconds` field in payload (default: `30` seconds) via AbortController. |
 | `agent-run` | Placeholder for sub-agent spawning (register your own) |
 
 ### Register a custom handler

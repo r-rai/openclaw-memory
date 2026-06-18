@@ -4,42 +4,56 @@
  * Architecture:
  *  - Redis Pub/Sub  → inter-agent events, real-time pub/sub channels
  *  - Redis Lists    → task queue (lpush → brpop)
- *  - Redis Keys     → correlation IDs, result storage, pub/sub state
+ *  - Redis Keys     → correlation IDs, result storage
  *
  * Plugin tools:
  *  event_publish    → publish an event to a channel
- *  event_subscribe  → subscribe to a channel (one-shot or persistent)
+ *  event_subscribe  → subscribe to a channel (one-shot)
  *  task_dispatch    → dispatch a task to a named queue, get correlationId
- *  task_subscribe   → worker-side: claim a task from a queue (blocking)
  *  task_results     → poll for a task result by correlationId
  */
 
 import { createRequire } from 'module';
-import { defineToolPlugin } from '/app/node_modules/openclaw/dist/plugin-sdk/tool-plugin.js';
 
 // ---------------------------------------------------------------------------
-// Redis (CommonJS)
+// Redis (CommonJS, loaded via createRequire for compatibility)
 // ---------------------------------------------------------------------------
 const _require = createRequire(import.meta.url);
-const { createClient: _createRedisClient } = _require(
-  '/home/node/.openclaw/plugins/TaskEventBus/node_modules/redis/dist/index.js'
-);
+const { createClient: _createRedisClient } = _require('redis');
 
 // ---------------------------------------------------------------------------
-// Config schema
+// Config
 // ---------------------------------------------------------------------------
 
 const ConfigSchema = {
   type: 'object',
   additionalProperties: false,
   properties: {
-    redisUrl: { type: 'string', default: 'redis://redis:6379' },
-    // How long (ms) a task result lives before expiring
-    resultTtlMs: { type: 'integer', default: 300000 },
-    // Default channel prefix for the event bus
-    channelPrefix: { type: 'string', default: 'teb' },
-    // Default queue prefix
-    queuePrefix: { type: 'string', default: 'tasks' },
+    redisUrl: {
+      type: 'string',
+      default: 'redis://redis:6379',
+      description: 'Redis connection URL',
+    },
+    resultTtlMs: {
+      type: 'integer',
+      default: 300000,
+      description: 'How long (ms) a task result lives before expiring',
+    },
+    channelPrefix: {
+      type: 'string',
+      default: 'teb',
+      description: 'Prefix for pub/sub channel names',
+    },
+    queuePrefix: {
+      type: 'string',
+      default: 'tasks',
+      description: 'Prefix for task queue list keys',
+    },
+    resultPrefix: {
+      type: 'string',
+      default: 'teb:result',
+      description: 'Redis key prefix for task results (must match TEB_RESULT_PREFIX in the worker)',
+    },
   },
 };
 
@@ -54,18 +68,11 @@ const EventPublishSchema = {
       type: 'string',
       description:
         'Channel name, e.g. "events:task.created", "events:agent.ui". ' +
-        'Use ":" as separator. Example channels: events:task.*, events:agent.*, events:system:*',
+        'Use ":" as separator.',
     },
     payload: {
       type: 'object',
-      description: 'JSON-serializable event payload.',
-    },
-    broadcast: {
-      type: 'boolean',
-      default: false,
-      description:
-        'If true, message is also published to a matching wildcard channel. ' +
-        'e.g. channel "events:task.created" with broadcast=true also publishes to "events:task.*"',
+      description: 'Arbitrary JSON payload to publish',
     },
   },
   required: ['channel', 'payload'],
@@ -77,20 +84,15 @@ const EventSubscribeSchema = {
   properties: {
     channel: {
       type: 'string',
-      description: 'Channel to subscribe to. Supports pattern matching with * wildcard.',
+      description: 'Channel name to subscribe to',
     },
-    agentId: {
-      type: 'string',
-      description: 'Agent that owns this subscription. Used as the subscriber identity.',
-    },
-    timeoutSeconds: {
+    timeoutMs: {
       type: 'integer',
-      minimum: 1,
-      default: 30,
-      description: 'Max time to wait for a message before returning empty.',
+      default: 5000,
+      description: 'How long to wait for a message before returning (ms)',
     },
   },
-  required: ['channel', 'agentId'],
+  required: ['channel'],
   additionalProperties: false,
 };
 
@@ -99,58 +101,31 @@ const TaskDispatchSchema = {
   properties: {
     queue: {
       type: 'string',
-      description:
-        'Queue name, e.g. "code", "qa", "research". ' +
-        'Results stored under correlationId with TTL so agents can poll.',
+      default: 'general',
+      description: 'Queue name to dispatch to (e.g. general, code, qa, research, ui)',
     },
     payload: {
       type: 'object',
-      description: 'Task payload — anything the worker needs to process this task.',
+      description: 'Task payload. Must include "type" field: "code-run", "web-fetch", "agent-run"',
     },
     priority: {
       type: 'integer',
+      minimum: 1,
+      maximum: 10,
       default: 0,
-      description:
-        'Higher priority tasks (1-10) are inserted near the front of the queue. ' +
-        'Default 0 = normal FIFO.',
-    },
-    ttlSeconds: {
-      type: 'integer',
-      minimum: 60,
-      default: 300,
-      description: 'How long the result should be kept after completion (default 5 min).',
+      description: 'Priority 1-10 (1=highest). Default 0 = standard FIFO queue',
     },
     correlationId: {
       type: 'string',
-      description:
-        'Optional idempotency key. If provided and a task with this ID was already dispatched, ' +
-        'returns the existing correlationId without queueing a duplicate.',
+      description: 'Optional idempotency ID. Auto-generated if not provided',
     },
-  },
-  required: ['queue', 'payload'],
-  additionalProperties: false,
-};
-
-const TaskSubscribeSchema = {
-  type: 'object',
-  properties: {
-    queues: {
-      type: 'array',
-      items: { type: 'string' },
-      description: 'List of queue names to subscribe to (blocking). First queue with a task wins.',
-    },
-    timeoutSeconds: {
+    ttlSeconds: {
       type: 'integer',
       minimum: 1,
-      default: 60,
-      description: 'How long to block waiting for a task (0 = infinite).',
-    },
-    workerId: {
-      type: 'string',
-      description: 'Unique ID for this worker. Used to track which worker claimed which task.',
+      description: 'Result TTL override (default from config)',
     },
   },
-  required: ['queues', 'workerId'],
+  required: ['payload'],
   additionalProperties: false,
 };
 
@@ -159,12 +134,12 @@ const TaskResultsSchema = {
   properties: {
     correlationId: {
       type: 'string',
-      description: 'Correlation ID returned by task_dispatch.',
+      description: 'Correlation ID returned by task_dispatch',
     },
-    clear: {
-      type: 'boolean',
-      default: false,
-      description: 'If true, consume and delete the result after reading.',
+    wait: {
+      type: 'integer',
+      default: 0,
+      description: 'Max ms to wait for a result if not yet available',
     },
   },
   required: ['correlationId'],
@@ -172,427 +147,226 @@ const TaskResultsSchema = {
 };
 
 // ---------------------------------------------------------------------------
-// EventBusManager
+// Plugin
 // ---------------------------------------------------------------------------
 
-class EventBusManager {
-  constructor(config = {}) {
+class TaskEventBusPlugin {
+  constructor(config) {
     this.redisUrl = config.redisUrl ?? 'redis://redis:6379';
+    this.resultTtlMs = config.resultTtlMs ?? 300000;
     this.channelPrefix = config.channelPrefix ?? 'teb';
     this.queuePrefix = config.queuePrefix ?? 'tasks';
-    this.resultTtlMs = config.resultTtlMs ?? 300000;
-
-    // Main client for all operations
-    this.client = _createRedisClient({ url: this.redisUrl });
-    // Separate client for pub (Redis requires separate connection for subscribe)
-    this.subscriber = _createRedisClient({ url: this.redisUrl });
-
-    this.connected = false;
-    this._pendingSubscriptions = new Map(); // channel → { resolve, reject, timeout }
+    this.resultPrefix = config.resultPrefix ?? 'teb:result';
+    /** @type {import('redis').RedisClientType | null} */
+    this._pubClient = null;
+    /** @type {import('redis').RedisClientType | null} */
+    this._subClient = null;
   }
 
-  async init() {
+  async _getPubClient() {
+    if (!this._pubClient) {
+      this._pubClient = _createRedisClient({ url: this.redisUrl });
+      this._pubClient.on('error', (e) => console.error('[TEB Redis pub]', e.message));
+      await this._pubClient.connect();
+    }
+    return this._pubClient;
+  }
+
+  async _getSubClient() {
+    if (!this._subClient) {
+      // Separate connection required for subscribe (subscribe mode is exclusive)
+      this._subClient = _createRedisClient({ url: this.redisUrl });
+      this._subClient.on('error', (e) => console.error('[TEB Redis sub]', e.message));
+      await this._subClient.connect();
+    }
+    return this._subClient;
+  }
+
+  async event_publish({ channel, payload } = {}) {
     try {
-      await this.client.connect();
-      await this.subscriber.connect();
-      this.connected = true;
-      console.log('[TaskEventBus] Redis connected');
-
-      // Wire up message handler for subscriptions
-      this.subscriber.on('pmessage', (pattern, channel, message) => {
-        this._dispatchMessage(channel, message);
-      });
-
-      console.log('[TaskEventBus] EventBusManager ready');
+      const fullChannel = channel.startsWith(this.channelPrefix) ? channel : `${this.channelPrefix}:${channel}`;
+      const client = await this._getPubClient();
+      const message = JSON.stringify({ payload, publishedAt: new Date().toISOString() });
+      const subscriberCount = await client.publish(fullChannel, message);
+      return { channel: fullChannel, subscriberCount, payload };
     } catch (err) {
-      console.warn('[TaskEventBus] Redis connection failed:', err?.message ?? err);
-      this.connected = false;
+      return { error: err.message, channel };
     }
   }
 
-  // -------------------------------------------------------------------------
-  // Internal subscription routing
-  // -------------------------------------------------------------------------
-
-  _dispatchMessage(channel, message) {
-    const pending = this._pendingSubscriptions.get(channel);
-    if (!pending) return;
-
-    let data;
+  async event_subscribe({ channel, timeoutMs = 5000 } = {}) {
     try {
-      data = JSON.parse(message);
-    } catch {
-      data = { raw: message };
-    }
+      const fullChannel = channel.startsWith(this.channelPrefix) ? channel : `${this.channelPrefix}:${channel}`;
+      const client = await this._getSubClient();
 
-    // Resolve the oldest pending subscribe for this channel
-    const entry = pending.shift();
-    if (entry) {
-      clearTimeout(entry.timeout);
-      entry.resolve({ channel, data });
-    }
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          client.unsubscribe(fullChannel);
+          resolve({ channel: fullChannel, message: null, timedOut: true });
+        }, timeoutMs);
 
-    // If more pending subs exist, re-arm the timeout
-    if (pending.length > 0) {
-      entry = pending[0];
-      entry.timeout = setTimeout(() => {
-        const idx = pending.indexOf(entry);
-        if (idx >= 0) pending.splice(idx, 1);
-        entry.resolve({ channel, data: null, timedOut: true });
-      }, entry.timeoutMs);
-    }
-  }
-
-  // -------------------------------------------------------------------------
-  // Event publish
-  // -------------------------------------------------------------------------
-
-  async eventPublish(channel, payload, broadcast = false) {
-    if (!this.connected) return { published: false, reason: 'Redis not connected' };
-
-    const fullChannel = `${this.channelPrefix}:${channel}`;
-    const message = JSON.stringify(payload);
-
-    await this.client.publish(fullChannel, message);
-
-    // Optional wildcard broadcast: publish to matching wildcard patterns
-    const broadcastChannels = [];
-    if (broadcast && channel.includes('.')) {
-      // e.g. "task.created" → also publish to "task.*"
-      const [ns, event] = channel.split('.');
-      const wildcard = `${this.channelPrefix}:${ns}.*`;
-      await this.client.publish(wildcard, message);
-      broadcastChannels.push(wildcard);
-    }
-
-    return { published: true, channel: fullChannel, broadcastChannels };
-  }
-
-  // -------------------------------------------------------------------------
-  // Event subscribe (one-shot with timeout)
-  // -------------------------------------------------------------------------
-
-  async eventSubscribe(channel, agentId, timeoutSeconds = 30) {
-    if (!this.connected) return { received: false, reason: 'Redis not connected' };
-
-    const fullChannel = `${this.channelPrefix}:${channel}`;
-
-    return new Promise((resolve) => {
-      const timeout = setTimeout(() => {
-        const pending = this._pendingSubscriptions.get(fullChannel);
-        if (pending) {
-          const idx = pending.indexOf(entry);
-          if (idx >= 0) pending.splice(idx, 1);
-        }
-        resolve({ received: false, timedOut: true, channel: fullChannel });
-      }, timeoutSeconds * 1000);
-
-      const entry = { resolve, timeout, timeoutMs: timeoutSeconds * 1000 };
-
-      if (!this._pendingSubscriptions.has(fullChannel)) {
-        this._pendingSubscriptions.set(fullChannel, []);
-        // Subscribe to the channel/pattern
-        if (channel.includes('*')) {
-          this.subscriber.pSubscribe(`${this.channelPrefix}:${channel}`);
-        } else {
-          this.subscriber.subscribe(fullChannel);
-        }
-      }
-
-      this._pendingSubscriptions.get(fullChannel).push(entry);
-    });
-  }
-
-  // -------------------------------------------------------------------------
-  // Task dispatch
-  // -------------------------------------------------------------------------
-
-  async taskDispatch(queue, payload, priority = 0, ttlSeconds = 300, correlationId = null) {
-    if (!this.connected) return { dispatched: false, reason: 'Redis not connected' };
-
-    // Idempotency: if correlationId provided and exists, skip dispatch
-    if (correlationId) {
-      const existing = await this.client.get(`teb:result:${correlationId}`);
-      if (existing) {
-        const result = JSON.parse(existing);
-        return { dispatched: false, idempotent: true, correlationId, existingResult: result };
-      }
-    }
-
-    const id = correlationId ?? `teb-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const fullQueue = `${this.queuePrefix}:${queue}`;
-
-    const task = {
-      correlationId: id,
-      queue,
-      payload,
-      priority,
-      createdAt: new Date().toISOString(),
-    };
-
-    if (priority > 0) {
-      // Priority: store in a sorted set, scored by priority (higher = earlier)
-      await this.client.zAdd(fullQueue, {
-        score: 1000 - priority, // invert so highest priority = lowest score = comes first
-        value: JSON.stringify(task),
-      });
-    } else {
-      // Normal FIFO: push to list head
-      await this.client.lPush(fullQueue, JSON.stringify(task));
-    }
-
-    // Expose result key for polling
-    await this.client.setEx(`teb:result:${id}`, ttlSeconds, JSON.stringify({ status: 'pending' }));
-
-    return { dispatched: true, correlationId: id, queue: fullQueue };
-  }
-
-  // -------------------------------------------------------------------------
-  // Task subscribe (worker-side blocking pop)
-  // -------------------------------------------------------------------------
-
-  async taskSubscribe(queues, workerId, timeoutSeconds = 60) {
-    if (!this.connected) return { received: false, reason: 'Redis not connected' };
-
-    const fullQueues = queues.map((q) => `${this.queuePrefix}:${q}`);
-
-    // First try priority queues (sorted set) for each queue
-    for (const q of fullQueues) {
-      const task = await this.client.zRange(q, 0, 0); // peek highest priority
-      if (task.length > 0) {
-        await this.client.zRem(q, task[0]);
-        const parsed = JSON.parse(task[0]);
-        // Mark as processing
-        await this.client.setEx(
-          `teb:result:${parsed.correlationId}`,
-          300,
-          JSON.stringify({ status: 'processing', workerId, startedAt: new Date().toISOString() })
-        );
-        return { received: true, task: parsed, queue: q.replace(`${this.queuePrefix}:`, '') };
-      }
-    }
-
-    // Then try normal queues with brpop
-    if (timeoutSeconds > 0) {
-      // Note: brpopMulti doesn't exist in older redis, use brpop on each
-      for (const q of fullQueues) {
-        try {
-          const result = await this.client.brPop(q, timeoutSeconds);
-          if (result) {
-            const parsed = JSON.parse(result.element);
-            await this.client.setEx(
-              `teb:result:${parsed.correlationId}`,
-              300,
-              JSON.stringify({ status: 'processing', workerId, startedAt: new Date().toISOString() })
-            );
-            return {
-              received: true,
-              task: parsed,
-              queue: q.replace(`${this.queuePrefix}:`, ''),
-            };
+        client.subscribe(fullChannel, (message) => {
+          clearTimeout(timer);
+          client.unsubscribe(fullChannel);
+          try {
+            const parsed = JSON.parse(message);
+            resolve({ channel: fullChannel, message: parsed, timedOut: false });
+          } catch {
+            resolve({ channel: fullChannel, message: { raw: message }, timedOut: false });
           }
-        } catch {
-          // brPopTimeout = no item available, try next queue
-        }
+        });
+
+        client.on('error', (err) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+      });
+    } catch (err) {
+      return { error: err.message, channel };
+    }
+  }
+
+  async task_dispatch({ queue = 'general', payload, priority = 0, correlationId, ttlSeconds } = {}) {
+    try {
+      const id = correlationId ?? `teb-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const fullQueue = `${this.queuePrefix}:${queue}`;
+
+      const task = {
+        correlationId: id,
+        queue,
+        payload,
+        priority,
+        createdAt: new Date().toISOString(),
+      };
+
+      const client = await this._getPubClient();
+      const ttl = ttlSeconds ?? Math.floor(this.resultTtlMs / 1000);
+
+      // Idempotency: skip if already dispatched (result key already exists)
+      const resultKey = `${this.resultPrefix}:${id}`;
+      const existing = await client.get(resultKey);
+      if (existing) {
+        const parsed = JSON.parse(existing);
+        return { correlationId: id, skipped: true, currentStatus: parsed.status };
       }
+
+      // Push to queue (priority 1-10 goes to sorted set; 0 = standard FIFO)
+      if (priority >= 1 && priority <= 10) {
+        // Priority queue: score = priority (lower = higher priority)
+        // Incorporate timestamp to ensure FIFO for same-priority tasks
+        const score = priority * 1e13 + Date.now();
+        const priorityQueue = `${fullQueue}:priority`;
+        await client.zAdd(priorityQueue, { score, value: JSON.stringify(task) });
+      } else {
+        // Standard FIFO
+        await client.lPush(fullQueue, JSON.stringify(task));
+      }
+
+      // Initialize result as pending
+      await client.setEx(resultKey, ttl, JSON.stringify({ status: 'pending', correlationId: id }));
+
+      return { correlationId: id, queue, priority, dispatchedAt: task.createdAt };
+    } catch (err) {
+      return { error: err.message };
     }
-
-    return { received: false, timedOut: true };
   }
 
-  // -------------------------------------------------------------------------
-  // Task result update (worker calls this on completion)
-  // -------------------------------------------------------------------------
+  async task_results({ correlationId, wait = 0 } = {}) {
+    try {
+      const client = await this._getPubClient();
+      const resultKey = `${this.resultPrefix}:${correlationId}`;
 
-  async taskComplete(correlationId, result, ttlSeconds = 300) {
-    if (!this.connected) return false;
-    await this.client.setEx(
-      `teb:result:${correlationId}`,
-      ttlSeconds,
-      JSON.stringify({ status: 'completed', result, completedAt: new Date().toISOString() })
-    );
-    return true;
-  }
+      // Poll up to `wait` ms for a non-pending result
+      const deadline = Date.now() + wait;
+      while (true) {
+        const raw = await client.get(resultKey);
+        if (raw) {
+          const result = JSON.parse(raw);
+          if (result.status !== 'pending') return result;
+        }
+        if (Date.now() >= deadline) break;
+        await new Promise((r) => setTimeout(r, 200));
+      }
 
-  async taskFail(correlationId, error, ttlSeconds = 300) {
-    if (!this.connected) return false;
-    await this.client.setEx(
-      `teb:result:${correlationId}`,
-      ttlSeconds,
-      JSON.stringify({ status: 'failed', error: String(error), failedAt: new Date().toISOString() })
-    );
-    return true;
-  }
-
-  // -------------------------------------------------------------------------
-  // Task results poll (agent-side)
-  // -------------------------------------------------------------------------
-
-  async taskResults(correlationId, clear = false) {
-    if (!this.connected) return { found: false, reason: 'Redis not connected' };
-    const key = `teb:result:${correlationId}`;
-    const raw = await this.client.get(key);
-    if (!raw) return { found: false, reason: 'No result found for this correlationId' };
-
-    const result = JSON.parse(raw);
-
-    if (clear) {
-      await this.client.del(key);
+      // Return current state (might still be pending)
+      const raw = await client.get(resultKey);
+      if (raw) return JSON.parse(raw);
+      return { status: 'not_found', correlationId };
+    } catch (err) {
+      return { error: err.message, correlationId };
     }
+  }
 
-    return { found: true, ...result };
+  async initialize() {
+    await Promise.all([this._getPubClient(), this._getSubClient()]);
+    console.log('[TaskEventBus] Initialized');
+  }
+
+  async destroy() {
+    if (this._pubClient) { await this._pubClient.quit(); this._pubClient = null; }
+    if (this._subClient) { await this._subClient.quit(); this._subClient = null; }
   }
 }
 
 // ---------------------------------------------------------------------------
-// Module-level singleton
+// Plugin registration
 // ---------------------------------------------------------------------------
 
-let _manager = null;
-
-function getManager(config = {}) {
-  if (!_manager) {
-    _manager = new EventBusManager(config);
-    _manager.init().catch((err) =>
-      console.error('[TaskEventBus] init error:', err)
-    );
+let _plugin = null;
+function getPlugin(config) {
+  if (!_plugin) {
+    _plugin = new TaskEventBusPlugin(config);
+    _plugin.initialize().catch((err) => console.error('[TEB Initialize Error]', err));
+  } else {
+    // Config is frozen at first init — restart OpenClaw to apply config changes
+    console.warn('[TEB] Config update ignored — plugin already initialized. Restart to apply changes.');
   }
-  return _manager;
+  return _plugin;
 }
 
-// ---------------------------------------------------------------------------
-// Plugin entry point
-// ---------------------------------------------------------------------------
+import { defineToolPlugin } from 'openclaw/plugin-sdk/tool-plugin';
 
-const plugin = defineToolPlugin({
+export default defineToolPlugin({
   id: 'task-event-bus',
-  name: 'Task & Event Bus',
-  description:
-    'Redis-backed task queue and event bus. ' +
-    'event_publish/subscribe for pub/sub between agents. ' +
-    'task_dispatch/subscribe/results for async task processing. ' +
-    'Workers are standalone processes; agents dispatch tasks and poll for results.',
-
+  name: 'Task Event Bus',
+  description: 'Redis-backed unified task queue and event bus for OpenClaw agents',
   configSchema: ConfigSchema,
-
   tools: (tool) => [
-    // ── event_publish ──────────────────────────────────────────────────────
     tool({
       name: 'event_publish',
       label: 'Event Publish',
-      description:
-        'Publish an event to a channel. Any agent or process subscribed to the channel ' +
-        'receives it immediately. Use for inter-agent notifications, system events, ' +
-        'or triggering workflows. ' +
-        'Example: publish("events:task.created", { task: "build", agent: "code-agent" })',
-
+      description: 'Publish an event to a Redis pub/sub channel',
       parameters: EventPublishSchema,
-
-      async execute(params, config) {
-        const mgr = getManager(config ?? {});
-        const { channel, payload, broadcast } = params;
-        const result = await mgr.eventPublish(channel, payload, broadcast ?? false);
-        return result;
-      },
+      execute(params, config, context) {
+        return getPlugin(config).event_publish(params);
+      }
     }),
-
-    // ── event_subscribe ───────────────────────────────────────────────────
     tool({
       name: 'event_subscribe',
       label: 'Event Subscribe',
-      description:
-        'Subscribe to an event channel and wait for the next message (one-shot). ' +
-        'Timeout returns empty if no message arrives. ' +
-        'Supports wildcard channels: "events:task.*" matches "events:task.created", ' +
-        '"events:task.completed", etc. ' +
-        'For persistent listening, call repeatedly with short timeouts.',
-
+      description: 'Subscribe to a Redis pub/sub channel (one-shot, with timeout)',
       parameters: EventSubscribeSchema,
-
-      async execute(params, config) {
-        const mgr = getManager(config ?? {});
-        const { channel, agentId, timeoutSeconds } = params;
-        const result = await mgr.eventSubscribe(
-          channel,
-          agentId ?? 'unknown',
-          timeoutSeconds ?? 30
-        );
-        return result;
-      },
+      execute(params, config, context) {
+        return getPlugin(config).event_subscribe(params);
+      }
     }),
-
-    // ── task_dispatch ─────────────────────────────────────────────────────
     tool({
       name: 'task_dispatch',
       label: 'Task Dispatch',
-      description:
-        'Dispatch a task to a named queue. Returns a correlationId for polling ' +
-        'the result later with task_results. ' +
-        'Workers (standalone processes) consume from these queues via task_subscribe. ' +
-        'Queues: "code", "qa", "research", "ui", "general". ' +
-        'Use priority=1-10 to jump ahead in queue for urgent tasks.',
-
+      description: 'Dispatch an async task to a Redis queue, get a correlationId',
       parameters: TaskDispatchSchema,
-
-      async execute(params, config) {
-        const mgr = getManager(config ?? {});
-        const { queue, payload, priority, ttlSeconds, correlationId } = params;
-        const result = await mgr.taskDispatch(
-          queue,
-          payload,
-          priority ?? 0,
-          ttlSeconds ?? 300,
-          correlationId ?? null
-        );
-        return result;
-      },
+      execute(params, config, context) {
+        return getPlugin(config).task_dispatch(params);
+      }
     }),
-
-    // ── task_subscribe (worker-facing) ───────────────────────────────────
-    tool({
-      name: 'task_subscribe',
-      label: 'Task Subscribe',
-      description:
-        'Worker-side: block-wait for a task from one or more queues. ' +
-        'Returns the task payload and marks it as "processing". ' +
-        'After completing the work, the worker MUST call task_results with ' +
-        'status=completed (via a separate internal mechanism or direct Redis write). ' +
-        'This tool is primarily for worker processes, not agents.',
-
-      parameters: TaskSubscribeSchema,
-
-      async execute(params, config) {
-        const mgr = getManager(config ?? {});
-        const { queues, workerId, timeoutSeconds } = params;
-        const result = await mgr.taskSubscribe(
-          queues,
-          workerId ?? 'unknown',
-          timeoutSeconds ?? 60
-        );
-        return result;
-      },
-    }),
-
-    // ── task_results ──────────────────────────────────────────────────────
     tool({
       name: 'task_results',
       label: 'Task Results',
-      description:
-        'Poll for a task result by correlationId. ' +
-        'Returns { status: "pending" | "completed" | "failed", result?, error? }. ' +
-        'Agents should poll this every few seconds after task_dispatch. ' +
-        'Set clear=true to consume and delete the result after reading (idempotent).',
-
+      description: 'Poll for a task result by correlationId',
       parameters: TaskResultsSchema,
-
-      async execute(params, config) {
-        const mgr = getManager(config ?? {});
-        const { correlationId, clear } = params;
-        const result = await mgr.taskResults(correlationId, clear ?? false);
-        return result;
-      },
-    }),
-  ],
+      execute(params, config, context) {
+        return getPlugin(config).task_results(params);
+      }
+    })
+  ]
 });
-
-export default plugin;

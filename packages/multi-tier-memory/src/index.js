@@ -10,8 +10,7 @@
  */
 
 import { createRequire } from 'module';
-import { resolve, dirname } from 'path';
-import { fileURLToPath } from 'url';
+import crypto from 'crypto';
 
 // ---------------------------------------------------------------------------
 // Resolve CJS packages relative to this file's location
@@ -64,6 +63,11 @@ const ConfigSchema = {
       type: 'string',
       default: 'agent_memory',
       description: 'Qdrant collection name for cold-tier vectors',
+    },
+    hotKeyPrefix: {
+      type: 'string',
+      default: 'mtm:hot',
+      description: 'Redis key prefix for hot-cache entries (change to avoid collisions on shared Redis)',
     },
   },
 };
@@ -191,13 +195,15 @@ class MultiTierMemoryPlugin {
     this.vectorSize = config.vectorSize ?? 768;
     this.hotTtlSeconds = config.hotTtlSeconds ?? 3600;
     this.coldCollection = config.coldCollection ?? 'agent_memory';
+    this.hotKeyPrefix = config.hotKeyPrefix ?? 'mtm:hot';
 
     /** @type {import('redis').RedisClientType | null} */
     this._redis = null;
     /** @type {QdrantClient | null} */
     this._qdrant = null;
     this._embedUrl = `${this.embeddingUrl}/embeddings`;
-    this._coldInitialized = false;
+    /** @type {Promise<void> | null} — promise lock to prevent concurrent collection creation */
+    this._coldInitPromise = null;
   }
 
   // ── Redis ──────────────────────────────────────────────────────────────
@@ -213,17 +219,17 @@ class MultiTierMemoryPlugin {
 
   async _hotGet(agentId, key) {
     const redis = await this._getRedis();
-    return redis.get(`mtm:hot:${agentId}:${key}`);
+    return redis.get(`${this.hotKeyPrefix}:${agentId}:${key}`);
   }
 
   async _hotSet(agentId, key, value, ttlSeconds) {
     const redis = await this._getRedis();
-    await redis.setEx(`mtm:hot:${agentId}:${key}`, ttlSeconds, value);
+    await redis.setEx(`${this.hotKeyPrefix}:${agentId}:${key}`, ttlSeconds, value);
   }
 
   async _hotDel(agentId, key) {
     const redis = await this._getRedis();
-    await redis.del(`mtm:hot:${agentId}:${key}`);
+    await redis.del(`${this.hotKeyPrefix}:${agentId}:${key}`);
   }
 
   // ── Embeddings ─────────────────────────────────────────────────────────
@@ -249,18 +255,22 @@ class MultiTierMemoryPlugin {
   }
 
   async _ensureColdCollection() {
-    if (this._coldInitialized) return;
-    const q = await this._getQdrant();
-    try {
-      await q.getCollection(this.coldCollection);
-    } catch {
-      // Collection doesn't exist — create it
-      await q.createCollection(this.coldCollection, {
-        vectors: { size: this.vectorSize, distance: 'Cosine' },
-      });
-      console.log(`[MTM] Created Qdrant collection: ${this.coldCollection}`);
+    // Promise-based lock: all concurrent callers await the same init promise
+    if (!this._coldInitPromise) {
+      this._coldInitPromise = (async () => {
+        const q = await this._getQdrant();
+        try {
+          await q.getCollection(this.coldCollection);
+        } catch {
+          // Collection doesn't exist — create it
+          await q.createCollection(this.coldCollection, {
+            vectors: { size: this.vectorSize, distance: 'Cosine' },
+          });
+          console.log(`[MTM] Created Qdrant collection: ${this.coldCollection}`);
+        }
+      })();
     }
-    this._coldInitialized = true;
+    return this._coldInitPromise;
   }
 
   async _coldSearch(embedding, limit, minScore, agentId) {
@@ -285,10 +295,15 @@ class MultiTierMemoryPlugin {
     }));
   }
 
+  _generateDeterministicUuid(agentId, path) {
+    const hash = crypto.createHash('md5').update(`${agentId}:${path}`).digest('hex');
+    return `${hash.slice(0, 8)}-${hash.slice(8, 12)}-${hash.slice(12, 16)}-${hash.slice(16, 20)}-${hash.slice(20, 32)}`;
+  }
+
   async _coldUpsert(agentId, key, content, embedding, importance, metadata) {
     await this._ensureColdCollection();
     const q = await this._getQdrant();
-    const id = `${agentId}:${key}`;
+    const id = this._generateDeterministicUuid(agentId, key);
     await q.upsert(this.coldCollection, {
       wait: true,
       points: [
@@ -315,22 +330,33 @@ class MultiTierMemoryPlugin {
       // Also check hot tier (Redis) for recent entries
       const redis = await this._getRedis();
       let hotItems = [];
-      if (agentId) {
-        const hotKey = `mtm:hot:${agentId}:*`;
-        // Scan for hot entries matching query terms
-        const keys = await redis.keys(hotKey);
-        for (const k of keys.slice(0, 20)) {
-          const v = await redis.get(k);
-          if (v) {
-            try {
-              const item = JSON.parse(v);
-              // Light text match against query
-              if (item.content && query.toLowerCase().split(' ').some((w) => item.content.toLowerCase().includes(w))) {
-                hotItems.push({ source: 'hot', score: 0.95, ...item });
-              }
-            } catch {
-              // not JSON, skip
+      const prefixPattern = `${this.hotKeyPrefix}:`;
+      const scanPattern = agentId ? `${this.hotKeyPrefix}:${agentId}:*` : `${this.hotKeyPrefix}:*`;
+
+      // Scan for matching hot keys
+      const keys = [];
+      for await (const key of redis.scanIterator({ MATCH: scanPattern, COUNT: 100 })) {
+        keys.push(key);
+        if (keys.length >= 20) break;
+      }
+
+      // Batch fetch all values in a single round-trip
+      if (keys.length > 0) {
+        const values = await redis.mGet(keys);
+        for (let i = 0; i < keys.length; i++) {
+          const v = values[i];
+          if (!v) continue;
+          try {
+            const item = JSON.parse(v);
+            // Light text match against query
+            if (item.content && query.toLowerCase().split(' ').some((w) => item.content.toLowerCase().includes(w))) {
+              const parts = keys[i].substring(prefixPattern.length).split(':');
+              const itemAgentId = parts[0];
+              const path = parts.slice(1).join(':');
+              hotItems.push({ source: 'hot', score: 0.95, path, agentId: itemAgentId, ...item });
             }
+          } catch {
+            // not JSON, skip
           }
         }
       }
@@ -370,12 +396,14 @@ class MultiTierMemoryPlugin {
           ...(agentId ? [{ key: 'agentId', match: { value: agentId } }] : []),
         ],
       };
-      const results = await q.search(this.coldCollection, {
-        vector: new Array(this.vectorSize).fill(0), // dummy — we'll filter by path
-        limit: 1,
+      
+      const response = await q.scroll(this.coldCollection, {
         filter,
+        limit: 1,
         with_payload: true,
+        with_vector: false
       });
+      const results = response.points || [];
 
       if (!results.length) return { error: 'Memory not found', path };
 
@@ -396,7 +424,8 @@ class MultiTierMemoryPlugin {
     }
   }
 
-  async memory_store({ path, content, importance = 0.5, agentId = 'default', metadata = {} } = {}) {
+  async memory_store({ path, content, importance = 0.5, agentId, metadata = {} } = {}) {
+    if (!agentId) return { error: 'agentId is required for memory_store' };
     try {
       // Always write to hot cache
       await this._hotSet(agentId, path, JSON.stringify({ content, importance, metadata }), this.hotTtlSeconds);
@@ -420,7 +449,7 @@ class MultiTierMemoryPlugin {
       if (!agentId) return { error: 'agentId is required' };
 
       const redis = await this._getRedis();
-      const key = `mtm:hot:${agentId}:${path}`;
+      const key = `${this.hotKeyPrefix}:${agentId}:${path}`;
       const existing = await redis.get(key);
 
       if (!existing) return { path, updated: false, error: 'Hot cache entry not found' };
@@ -455,22 +484,61 @@ class MultiTierMemoryPlugin {
 // Plugin registration
 // ---------------------------------------------------------------------------
 
-// openclaw is a peer dependency. In the OpenClaw container it resolves from
-// /app/node_modules/openclaw. For local dev / npm installs, it comes from
-// the openclaw package in node_modules.
-import { defineToolPlugin } from 'openclaw';
+let _plugin = null;
+function getPlugin(config) {
+  if (!_plugin) {
+    _plugin = new MultiTierMemoryPlugin(config);
+    _plugin.initialize().catch((err) => console.error('[MTM Initialize Error]', err));
+  } else {
+    // Config is frozen at first init — restart OpenClaw to apply config changes
+    console.warn('[MTM] Config update ignored — plugin already initialized. Restart to apply changes.');
+  }
+  return _plugin;
+}
+
+import { defineToolPlugin } from 'openclaw/plugin-sdk/tool-plugin';
 
 export default defineToolPlugin({
-  name: 'multi-tier-memory',
-  version: '1.0.0',
-  config: ConfigSchema,
-
-  tools: [
-    { name: 'memory_search', description: 'Semantic memory search across hot (Redis) and cold (Qdrant) tiers', schema: MemorySearchSchema, handler: (args, ctx) => ctx.plugin.memory_search(args) },
-    { name: 'memory_get', description: 'Read a specific memory entry by path', schema: MemoryGetSchema, handler: (args, ctx) => ctx.plugin.memory_get(args) },
-    { name: 'memory_store', description: 'Store a memory entry (auto-caches important items to cold tier)', schema: MemoryStoreSchema, handler: (args, ctx) => ctx.plugin.memory_store(args) },
-    { name: 'memory_cache_update', description: 'Update the TTL of a hot-cache entry in Redis', schema: MemoryCacheUpdateSchema, handler: (args, ctx) => ctx.plugin.memory_cache_update(args) },
-  ],
-
-  factory: (config) => new MultiTierMemoryPlugin(config),
+  id: 'multi-tier-memory',
+  name: 'Multi-Tier Memory',
+  description: 'Three-tier memory system: Redis (hot) + Qdrant (cold) + llama.cpp embeddings',
+  configSchema: ConfigSchema,
+  tools: (tool) => [
+    tool({
+      name: 'memory_search',
+      label: 'Memory Search',
+      description: 'Semantic memory search across hot (Redis) and cold (Qdrant) tiers',
+      parameters: MemorySearchSchema,
+      execute(params, config, context) {
+        return getPlugin(config).memory_search(params);
+      }
+    }),
+    tool({
+      name: 'memory_get',
+      label: 'Memory Get',
+      description: 'Read a specific memory entry by path',
+      parameters: MemoryGetSchema,
+      execute(params, config, context) {
+        return getPlugin(config).memory_get(params);
+      }
+    }),
+    tool({
+      name: 'memory_store',
+      label: 'Memory Store',
+      description: 'Store a memory entry (auto-caches important items to cold tier)',
+      parameters: MemoryStoreSchema,
+      execute(params, config, context) {
+        return getPlugin(config).memory_store(params);
+      }
+    }),
+    tool({
+      name: 'memory_cache_update',
+      label: 'Memory Cache Update',
+      description: 'Update the TTL of a hot-cache entry in Redis',
+      parameters: MemoryCacheUpdateSchema,
+      execute(params, config, context) {
+        return getPlugin(config).memory_cache_update(params);
+      }
+    }),
+  ]
 });

@@ -1,12 +1,14 @@
 {
   "$schema": "https://docs.openclaw.ai/schema/pluginManifest.json",
-  "name": "task-event-bus",
+  "name": "Task Event Bus",
   "version": "1.0.0",
-  "description": "Redis-backed unified task queue and event bus for OpenClaw agents. Publish/subscribe + async task dispatch with a persistent worker container.",
+  "description": "Redis-backed unified task queue and event bus for OpenClaw agents",
   "author": "Ravi Rai",
   "license": "MIT",
   "openclaw": {
-    "extensions": ["./dist/index.js"]
+    "extensions": [
+      "./dist/index.js"
+    ]
   },
   "config": {
     "redisUrl": {
@@ -25,5 +27,48 @@
       "type": "string",
       "default": "tasks"
     }
+  },
+  "id": "task-event-bus",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "redisUrl": {
+        "type": "string",
+        "default": "redis://redis:6379",
+        "description": "Redis connection URL"
+      },
+      "resultTtlMs": {
+        "type": "integer",
+        "default": 300000,
+        "description": "How long (ms) a task result lives before expiring"
+      },
+      "channelPrefix": {
+        "type": "string",
+        "default": "teb",
+        "description": "Prefix for pub/sub channel names"
+      },
+      "queuePrefix": {
+        "type": "string",
+        "default": "tasks",
+        "description": "Prefix for task queue list keys"
+      },
+      "resultPrefix": {
+        "type": "string",
+        "default": "teb:result",
+        "description": "Redis key prefix for task results (must match TEB_RESULT_PREFIX in the worker)"
+      }
+    }
+  },
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": [
+      "event_publish",
+      "event_subscribe",
+      "task_dispatch",
+      "task_results"
+    ]
   }
 }

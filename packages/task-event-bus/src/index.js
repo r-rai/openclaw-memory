@@ -49,6 +49,11 @@ const ConfigSchema = {
       default: 'tasks',
       description: 'Prefix for task queue list keys',
     },
+    resultPrefix: {
+      type: 'string',
+      default: 'teb:result',
+      description: 'Redis key prefix for task results (must match TEB_RESULT_PREFIX in the worker)',
+    },
   },
 };
 
@@ -151,6 +156,7 @@ class TaskEventBusPlugin {
     this.resultTtlMs = config.resultTtlMs ?? 300000;
     this.channelPrefix = config.channelPrefix ?? 'teb';
     this.queuePrefix = config.queuePrefix ?? 'tasks';
+    this.resultPrefix = config.resultPrefix ?? 'teb:result';
     /** @type {import('redis').RedisClientType | null} */
     this._pubClient = null;
     /** @type {import('redis').RedisClientType | null} */
@@ -237,7 +243,7 @@ class TaskEventBusPlugin {
       const ttl = ttlSeconds ?? Math.floor(this.resultTtlMs / 1000);
 
       // Idempotency: skip if already dispatched (result key already exists)
-      const resultKey = `teb:result:${id}`;
+      const resultKey = `${this.resultPrefix}:${id}`;
       const existing = await client.get(resultKey);
       if (existing) {
         const parsed = JSON.parse(existing);
@@ -247,7 +253,10 @@ class TaskEventBusPlugin {
       // Push to queue (priority 1-10 goes to sorted set; 0 = standard FIFO)
       if (priority >= 1 && priority <= 10) {
         // Priority queue: score = priority (lower = higher priority)
-        await client.zAdd(fullQueue, { score: priority, value: JSON.stringify(task) });
+        // Incorporate timestamp to ensure FIFO for same-priority tasks
+        const score = priority * 1e13 + Date.now();
+        const priorityQueue = `${fullQueue}:priority`;
+        await client.zAdd(priorityQueue, { score, value: JSON.stringify(task) });
       } else {
         // Standard FIFO
         await client.lPush(fullQueue, JSON.stringify(task));
@@ -265,7 +274,7 @@ class TaskEventBusPlugin {
   async task_results({ correlationId, wait = 0 } = {}) {
     try {
       const client = await this._getPubClient();
-      const resultKey = `teb:result:${correlationId}`;
+      const resultKey = `${this.resultPrefix}:${correlationId}`;
 
       // Poll up to `wait` ms for a non-pending result
       const deadline = Date.now() + wait;
@@ -303,39 +312,61 @@ class TaskEventBusPlugin {
 // Plugin registration
 // ---------------------------------------------------------------------------
 
-import { defineToolPlugin } from 'openclaw';
+let _plugin = null;
+function getPlugin(config) {
+  if (!_plugin) {
+    _plugin = new TaskEventBusPlugin(config);
+    _plugin.initialize().catch((err) => console.error('[TEB Initialize Error]', err));
+  } else {
+    // Config is frozen at first init — restart OpenClaw to apply config changes
+    console.warn('[TEB] Config update ignored — plugin already initialized. Restart to apply changes.');
+  }
+  return _plugin;
+}
+
+import { defineToolPlugin } from 'openclaw/plugin-sdk/tool-plugin';
 
 export default defineToolPlugin({
-  name: 'task-event-bus',
-  version: '1.0.0',
-  config: ConfigSchema,
-
-  tools: [
-    {
+  id: 'task-event-bus',
+  name: 'Task Event Bus',
+  description: 'Redis-backed unified task queue and event bus for OpenClaw agents',
+  configSchema: ConfigSchema,
+  tools: (tool) => [
+    tool({
       name: 'event_publish',
+      label: 'Event Publish',
       description: 'Publish an event to a Redis pub/sub channel',
-      schema: EventPublishSchema,
-      handler: (args, ctx) => ctx.plugin.event_publish(args),
-    },
-    {
+      parameters: EventPublishSchema,
+      execute(params, config, context) {
+        return getPlugin(config).event_publish(params);
+      }
+    }),
+    tool({
       name: 'event_subscribe',
+      label: 'Event Subscribe',
       description: 'Subscribe to a Redis pub/sub channel (one-shot, with timeout)',
-      schema: EventSubscribeSchema,
-      handler: (args, ctx) => ctx.plugin.event_subscribe(args),
-    },
-    {
+      parameters: EventSubscribeSchema,
+      execute(params, config, context) {
+        return getPlugin(config).event_subscribe(params);
+      }
+    }),
+    tool({
       name: 'task_dispatch',
+      label: 'Task Dispatch',
       description: 'Dispatch an async task to a Redis queue, get a correlationId',
-      schema: TaskDispatchSchema,
-      handler: (args, ctx) => ctx.plugin.task_dispatch(args),
-    },
-    {
+      parameters: TaskDispatchSchema,
+      execute(params, config, context) {
+        return getPlugin(config).task_dispatch(params);
+      }
+    }),
+    tool({
       name: 'task_results',
+      label: 'Task Results',
       description: 'Poll for a task result by correlationId',
-      schema: TaskResultsSchema,
-      handler: (args, ctx) => ctx.plugin.task_results(args),
-    },
-  ],
-
-  factory: (config) => new TaskEventBusPlugin(config),
+      parameters: TaskResultsSchema,
+      execute(params, config, context) {
+        return getPlugin(config).task_results(params);
+      }
+    })
+  ]
 });

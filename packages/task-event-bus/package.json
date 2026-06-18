@@ -16,7 +16,9 @@
   },
   "main": "./dist/index.js",
   "openclaw": {
-    "extensions": ["./dist/index.js"]
+    "extensions": [
+      "./dist/index.js"
+    ]
   },
   "peerDependencies": {
     "openclaw": ">=1.0.0"
@@ -31,5 +33,10 @@
     "build": "node scripts/build.mjs",
     "clean": "rm -rf dist"
   },
-  "files": ["dist/", "src/", "openclaw.plugin.json", "README.md"]
+  "files": [
+    "dist/",
+    "src/",
+    "openclaw.plugin.json",
+    "README.md"
+  ]
 }

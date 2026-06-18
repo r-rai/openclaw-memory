@@ -1,12 +1,14 @@
 {
   "$schema": "https://docs.openclaw.ai/schema/pluginManifest.json",
-  "name": "multi-tier-memory",
+  "name": "Multi-Tier Memory",
   "version": "1.0.0",
-  "description": "Three-tier memory plugin: Redis (hot) + Qdrant (cold vector) + llama.cpp embeddings for OpenClaw agents",
+  "description": "Three-tier memory system: Redis (hot) + Qdrant (cold) + llama.cpp embeddings",
   "author": "Ravi Rai",
   "license": "MIT",
   "openclaw": {
-    "extensions": ["./dist/index.js"]
+    "extensions": [
+      "./dist/index.js"
+    ]
   },
   "config": {
     "redisUrl": {
@@ -37,5 +39,63 @@
       "type": "string",
       "default": "agent_memory"
     }
+  },
+  "id": "multi-tier-memory",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "redisUrl": {
+        "type": "string",
+        "default": "redis://redis:6379",
+        "description": "Redis connection URL (hot cache + pub/sub)"
+      },
+      "qdrantUrl": {
+        "type": "string",
+        "default": "http://qdrant:6333",
+        "description": "Qdrant HTTP URL (cold vector storage)"
+      },
+      "embeddingUrl": {
+        "type": "string",
+        "default": "http://llama-cpp:8080/v1",
+        "description": "llama.cpp embeddings API base URL"
+      },
+      "embeddingModel": {
+        "type": "string",
+        "default": "nomic-embed-text-v1.5.Q4_K_M.gguf",
+        "description": "Model name passed to /v1/embeddings"
+      },
+      "vectorSize": {
+        "type": "integer",
+        "default": 768,
+        "description": "Embedding dimensionality (must match your model)"
+      },
+      "hotTtlSeconds": {
+        "type": "integer",
+        "default": 3600,
+        "description": "How long hot-cache entries live in Redis (seconds)"
+      },
+      "coldCollection": {
+        "type": "string",
+        "default": "agent_memory",
+        "description": "Qdrant collection name for cold-tier vectors"
+      },
+      "hotKeyPrefix": {
+        "type": "string",
+        "default": "mtm:hot",
+        "description": "Redis key prefix for hot-cache entries (change to avoid collisions on shared Redis)"
+      }
+    }
+  },
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": [
+      "memory_search",
+      "memory_get",
+      "memory_store",
+      "memory_cache_update"
+    ]
   }
 }

@@ -117,6 +117,7 @@ services:
       TEB_QUEUE_PREFIX: "tasks"
       TEB_RESULT_TTL: "300"
       TEB_QUEUES: "general,code,qa,research,ui"
+      TEB_ALLOW_CODE_RUN: "false" # Set to "true" to enable the 'code-run' task type
     volumes:
       - "/path/to/openclaw-memory/packages/task-event-bus/dist:/app/worker/dist:ro"
     command: ["node", "/app/worker/dist/worker.js", "--queues", "general,code,qa,research,ui"]

@@ -164,6 +164,7 @@ Since workers use `brpop` (blocking pop), Redis atomically distributes work — 
 | Redis goes down | Worker reconnects automatically on next `brpop` |
 | Task handler throws | Result written as `status: failed`, error message stored |
 | Task times out | Handler sends `SIGKILL` after `timeoutSeconds` |
+| Web fetch times out | Request aborted via AbortController after `timeoutSeconds` (default: 30s), returning error: 'TIMEOUT' |
 
 ---
 
@@ -194,7 +195,8 @@ OpenClaw gateway and the task worker both resolve these via Docker DNS.
     "embeddingModel": "nomic-embed-text-v1.5.Q4_K_M.gguf",
     "vectorSize": 768,
     "hotTtlSeconds": 3600,
-    "coldCollection": "agent_memory"
+    "coldCollection": "agent_memory",
+    "hotKeyPrefix": "mtm:hot"
   }
 }
 ```
@@ -207,7 +209,8 @@ OpenClaw gateway and the task worker both resolve these via Docker DNS.
     "redisUrl": "redis://redis:6379",
     "resultTtlMs": 300000,
     "channelPrefix": "teb",
-    "queuePrefix": "tasks"
+    "queuePrefix": "tasks",
+    "resultPrefix": "teb:result"
   }
 }
 ```
@@ -218,18 +221,19 @@ OpenClaw gateway and the task worker both resolve these via Docker DNS.
 |----------|---------|-------------|
 | `TEB_REDIS_URL` | `redis://redis:6379` | Redis connection URL |
 | `TEB_QUEUE_PREFIX` | `tasks` | Redis key prefix for queues |
-| `TEB_RESULT_PREFIX` | `teb:result` | Redis key prefix for results |
+| `TEB_RESULT_PREFIX` | `teb:result` | Redis key prefix for results (must match plugin config) |
 | `TEB_WORKER_ID` | auto-generated | Unique worker ID |
 | `TEB_QUEUES` | `general,code,qa,research,ui` | Queues to consume |
 | `TEB_POLL_INTERVAL` | `3000` | Poll interval when queues empty (ms) |
 | `TEB_RESULT_TTL` | `300` | Result key TTL (seconds) |
+| `TEB_ALLOW_CODE_RUN` | `false` | Set to `true` to enable the 'code-run' task type |
 | `TEB_LOG_LEVEL` | `info` | debug \| info \| warn \| error |
 
 ---
 
 ## Security Considerations
 
-- The worker runs code via `code-run` tasks — restrict queue access appropriately
+- The worker runs code via `code-run` tasks — for security, this handler is **disabled by default** and requires setting `TEB_ALLOW_CODE_RUN=true` in the environment to enable.
 - Redis has no authentication by default — use `requirepass` or network-level isolation
 - Qdrant has no authentication by default — bind to internal network only
 - `hotTtlSeconds` limits how long unencrypted memory lives in Redis
@@ -238,7 +242,9 @@ OpenClaw gateway and the task worker both resolve these via Docker DNS.
 
 ## Performance Notes
 
-- Redis `brpop` is O(1) — queue depth has no impact on pop speed
+- Redis `brpop` is O(1) — queue depth has no impact on pop speed. The worker loop optimizes pops by checking priority queues with non-blocking `zPopMin` first, then utilizing a single blocking multi-key `brPop` call for the lower priority queues to minimize CPU polling overhead.
+- Redis search uses `mGet` to batch text matching queries instead of calling Redis sequentially, reducing round-trips.
+- Qdrant collection initialization utilizes a promise-lock to prevent concurrent schema creation race conditions during initialization.
 - Qdrant search is O(n) for the collection size — `agent_memory` stays lean by only storing `importance ≥ 0.7` entries
 - llama.cpp embeddings are the main latency source (~10–50ms per query)
 - Each agent should use a distinct `agentId` to scope memory and avoid cross-contamination

@@ -3,63 +3,77 @@
  * TaskEventBus Worker
  *
  * Standalone process that consumes tasks from Redis queues and processes them.
- * Run as: node worker.js [--queues code,qa,research] [--worker-id worker-1] [--poll-interval 5]
+ * Designed to run as a separate Docker container (survives OpenClaw restarts).
  *
- * For each task:
- *  1. Claims it from the queue (brpop / zpop)
- *  2. Calls the appropriate handler based on task.type
- *  3. Writes result back to Redis under teb:result:{correlationId}
- *  4. Optionally publishes an event on completion
+ * Usage:
+ *   node worker.js [--queues general,code,qa,research,ui]
  *
- * Supports task types:
- *  - "agent-run"  → spawn a sub-agent session with the given prompt
- *  - "code-run"    → run a shell command, capture output
- *  - "web-fetch"   → fetch a URL, return content
- *  - "custom"      → invoke a registered handler function
+ * Environment variables:
+ *   TEB_REDIS_URL        Redis URL (default: redis://redis:6379)
+ *   TEB_QUEUE_PREFIX     Queue key prefix (default: tasks)
+ *   TEB_RESULT_PREFIX    Result key prefix (default: teb:result)
+ *   TEB_WORKER_ID        Unique worker ID (auto-generated if unset)
+ *   TEB_QUEUES           Comma-separated queue names (default: general,code,qa,research,ui)
+ *   TEB_POLL_INTERVAL    Poll interval ms when queue is empty (default: 3000)
+ *   TEB_RESULT_TTL       Result TTL seconds (default: 300)
+ *   TEB_LOG_LEVEL        Log level: debug|info|warn|error (default: info)
  */
 
 import { createRequire } from 'module';
-import { readFileSync } from 'fs';
-import { resolve, dirname } from 'path';
-import { fileURLToPath } from 'url';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
+const _require = createRequire(import.meta.url);
+const { createClient: _createRedisClient } = _require('redis');
 
 // ---------------------------------------------------------------------------
-// Config (from env or defaults)
+// Config
 // ---------------------------------------------------------------------------
 
 const CONFIG = {
   redisUrl: process.env.TEB_REDIS_URL ?? 'redis://redis:6379',
   queuePrefix: process.env.TEB_QUEUE_PREFIX ?? 'tasks',
-  resultPrefix: 'teb:result',
-  // Auto-generate unique worker ID if not set:
-  //   - HOSTNAME env var is set automatically by Docker
-  //   - random suffix prevents restarts within the same second from colliding
-  workerId: process.env.TEB_WORKER_ID
-    ?? `worker-${process.env.HOSTNAME ?? 'node'}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
-  queues: (process.env.TEB_QUEUES ?? 'general,code,qa,research,ui').split(',').map((s) => s.trim()),
+  resultPrefix: process.env.TEB_RESULT_PREFIX ?? 'teb:result',
+  workerId:
+    process.env.TEB_WORKER_ID ??
+    `worker-${process.env.HOSTNAME ?? 'node'}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+  queues: (process.env.TEB_QUEUES ?? 'general,code,qa,research,ui')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean),
   pollIntervalMs: parseInt(process.env.TEB_POLL_INTERVAL ?? '3000', 10),
   resultTtlSeconds: parseInt(process.env.TEB_RESULT_TTL ?? '300', 10),
   logLevel: process.env.TEB_LOG_LEVEL ?? 'info',
 };
 
-// ---------------------------------------------------------------------------
-// Redis
-// ---------------------------------------------------------------------------
+const LOG = {
+  debug: (...a) => CONFIG.logLevel === 'debug' && console.debug(`[${ts()}] [DEBUG]`, ...a),
+  info: (...a) => ['debug', 'info'].includes(CONFIG.logLevel) && console.info(`[${ts()}] [INFO]`, ...a),
+  warn: (...a) => console.warn(`[${ts()}] [WARN]`, ...a),
+  error: (...a) => console.error(`[${ts()}] [ERROR]`, ...a),
+};
 
-const _require = createRequire(import.meta.url);
-const { createClient: _createRedisClient } = _require(
-  resolve(__dirname, '../node_modules/redis/dist/index.js')
-);
-
-const redis = _createRedisClient({ url: CONFIG.redisUrl });
-
-function log(level, ...args) {
-  if (CONFIG.logLevel === 'silent') return;
-  const prefix = `[${new Date().toISOString()}] [${level.toUpperCase()}] [${CONFIG.workerId}]`;
-  console[level === 'error' ? 'error' : 'log'](prefix, ...args);
+function ts() {
+  return new Date().toISOString().slice(11, 23);
 }
+
+// ---------------------------------------------------------------------------
+// CLI args
+// ---------------------------------------------------------------------------
+
+const args = process.argv.slice(2);
+for (let i = 0; i < args.length; i++) {
+  if (args[i] === '--queues' && args[i + 1]) {
+    CONFIG.queues = args[i + 1].split(',').map((s) => s.trim());
+    i++;
+  }
+  if (args[i] === '--worker-id' && args[i + 1]) {
+    CONFIG.workerId = args[i + 1];
+    i++;
+  }
+}
+
+LOG.info(`Worker ID: ${CONFIG.workerId}`);
+LOG.info(`Queues: ${CONFIG.queues.join(', ')}`);
+LOG.info(`Redis: ${CONFIG.redisUrl}`);
 
 // ---------------------------------------------------------------------------
 // Task handlers
@@ -67,299 +81,215 @@ function log(level, ...args) {
 
 const handlers = {
   /**
-   * agent-run: Spawn a sub-agent session with the given task
-   * Requires openclaw CLI access from this machine
+   * code-run — execute a shell command
+   * Payload: { command: string, timeoutSeconds?: number }
    */
-  async 'agent-run'(task, ctx) {
-    const { agentId, prompt, model, timeoutSeconds } = task.payload;
-    const correlationId = task.correlationId;
+  async 'code-run'(payload) {
+    if (process.env.TEB_ALLOW_CODE_RUN !== 'true') {
+      return { success: false, error: 'code-run is disabled. Set TEB_ALLOW_CODE_RUN=true to enable.' };
+    }
+    const { command, timeoutSeconds = 60 } = payload;
+    return new Promise((resolve) => {
+      const start = Date.now();
+      // Node.js child_process
+      const { spawn } = _require('child_process');
+      const child = spawn('/bin/sh', ['-c', command], { stdio: 'pipe' });
+      let stdout = '';
+      let stderr = '';
 
-    log('info', `agent-run: spawning ${agentId} for task ${correlationId}`);
+      child.stdout.on('data', (d) => (stdout += d.toString()));
+      child.stderr.on('data', (d) => (stderr += d.toString()));
 
-    try {
-      // Build the sessions_spawn command
-      const { spawn } = await import('child_process');
-      const args = [
-        'sessions',
-        'spawn',
-        '--agent-id', agentId,
-        '--message', prompt,
-        '--session-key', `teb-task-${correlationId}`,
-      ];
-      if (model) args.push('--model', model);
-      if (timeoutSeconds) args.push('--timeout-seconds', String(timeoutSeconds));
+      const timer = setTimeout(() => {
+        child.kill('SIGKILL');
+        resolve({ success: false, error: 'TIMEOUT', stdout, stderr, timedOut: true });
+      }, timeoutSeconds * 1000);
 
-      // For now, run as a detached process and poll for result
-      // In a full implementation, this would use OpenClaw's internal API
-      const { exec } = await import('child_process');
-
-      return new Promise((resolve) => {
-        const cmd = `openclaw sessions spawn --agent-id "${agentId}" --message "${prompt.replace(/"/g, '\\"')}" --session-key "teb-task-${correlationId}" --timeout-seconds ${timeoutSeconds ?? 60}`;
-        exec(cmd, { cwd: process.env.OPENCLAW_HOME ?? '/home/node/.openclaw' }, (err, stdout, stderr) => {
-          if (err) {
-            resolve({ success: false, error: err.message, stderr });
-          } else {
-            resolve({ success: true, stdout: stdout.slice(0, 2000) });
-          }
+      child.on('close', (code) => {
+        clearTimeout(timer);
+        resolve({
+          success: code === 0,
+          code,
+          stdout,
+          stderr,
+          durationMs: Date.now() - start,
         });
       });
-    } catch (err) {
-      return { success: false, error: err.message };
-    }
-  },
-
-  /**
-   * code-run: Execute a shell command
-   */
-  async 'code-run'(task, ctx) {
-    const { command, cwd, timeoutSeconds = 60, env = {} } = task.payload;
-    const correlationId = task.correlationId;
-
-    log('info', `code-run: executing: ${command.slice(0, 100)} for task ${correlationId}`);
-
-    return new Promise((resolve) => {
-      const { exec } = import('child_process').then(({ exec }) => {
-        const fullEnv = { ...process.env, ...env };
-        exec(
-          command,
-          { cwd: cwd ?? process.env.OPENCLAW_HOME ?? '/home/node/.openclaw', timeout: (timeoutSeconds ?? 60) * 1000, env: fullEnv },
-          (err, stdout, stderr) => {
-            if (err) {
-              resolve({ success: false, error: err.message, stderr: stderr?.slice(-1000) });
-            } else {
-              resolve({ success: true, stdout: stdout.slice(-5000), stderr: stderr?.slice(-1000) });
-            }
-          }
-        );
+      child.on('error', (err) => {
+        clearTimeout(timer);
+        resolve({ success: false, error: err.message });
       });
     });
   },
 
   /**
-   * web-fetch: Fetch a URL and return readable content
+   * web-fetch — fetch a URL and return content
+   * Payload: { url: string, method?: string, headers?: object, body?: string }
    */
-  async 'web-fetch'(task, ctx) {
-    const { url, maxChars = 10000, extractMode = 'markdown' } = task.payload;
-    const correlationId = task.correlationId;
-
-    log('info', `web-fetch: fetching ${url} for task ${correlationId}`);
-
+  async 'web-fetch'(payload) {
+    const { url, method = 'GET', headers = {}, body, timeoutSeconds = 30 } = payload;
+    const start = Date.now();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutSeconds * 1000);
     try {
-      const res = await fetch(url, {
-        signal: AbortSignal.timeout(30000),
-        headers: { 'User-Agent': 'TaskEventBus-Worker/1.0' },
-      });
-
-      if (!res.ok) {
-        return { success: false, error: `HTTP ${res.status}: ${res.statusText}` };
-      }
-
+      const res = await fetch(url, { method, headers, body, redirect: 'follow', signal: controller.signal });
       const text = await res.text();
+      clearTimeout(timer);
       return {
         success: true,
-        content: text.slice(0, maxChars),
         status: res.status,
-        url,
+        statusText: res.statusText,
+        headers: Object.fromEntries(res.headers.entries()),
+        body: text.slice(0, 10000), // cap at 10k chars
+        durationMs: Date.now() - start,
       };
     } catch (err) {
-      return { success: false, error: err.message };
+      clearTimeout(timer);
+      const isTimeout = err.name === 'AbortError';
+      return { success: false, error: isTimeout ? 'TIMEOUT' : err.message, timedOut: isTimeout, durationMs: Date.now() - start };
     }
   },
 
   /**
-   * custom: call a registered handler by name
+   * agent-run — placeholder for spawning an OpenClaw sub-agent
+   * Payload: { prompt: string, agentId?: string }
    */
-  async 'custom'(task, ctx) {
-    const { handler, payload } = task.payload;
-    if (ctx.customHandlers && ctx.customHandlers[handler]) {
-      return ctx.customHandlers[handler](payload, task);
-    }
-    return { success: false, error: `Unknown custom handler: ${handler}` };
+  async 'agent-run'(payload) {
+    return {
+      success: false,
+      error: 'agent-run handler not implemented — register with registerHandler()',
+    };
   },
 };
 
-// ---------------------------------------------------------------------------
-// Task processor
-// ---------------------------------------------------------------------------
-
-async function processTask(task, ctx) {
-  const type = task.payload?.type ?? task.payload?.taskType ?? 'unknown';
-  const handler = handlers[type] ?? handlers['custom'];
-
-  try {
-    const result = await handler(task, ctx);
-    return { success: true, result };
-  } catch (err) {
-    return { success: false, error: err.message };
-  }
+/** Register a custom task handler */
+export function registerHandler(type, fn) {
+  handlers[type] = fn;
+  LOG.info(`Registered handler: ${type}`);
 }
 
 // ---------------------------------------------------------------------------
-// Result writer
+// Redis
 // ---------------------------------------------------------------------------
 
-async function writeResult(correlationId, result, ttlSeconds) {
-  try {
-    await redis.setEx(
-      `${CONFIG.resultPrefix}:${correlationId}`,
-      ttlSeconds ?? CONFIG.resultTtlSeconds,
-      JSON.stringify({
-        status: 'completed',
-        result,
-        completedAt: new Date().toISOString(),
-        workerId: CONFIG.workerId,
-      })
-    );
-  } catch (err) {
-    log('error', `Failed to write result for ${correlationId}:`, err.message);
-  }
-}
+let redis;
 
-async function writeError(correlationId, error, ttlSeconds) {
-  try {
-    await redis.setEx(
-      `${CONFIG.resultPrefix}:${correlationId}`,
-      ttlSeconds ?? CONFIG.resultTtlSeconds,
-      JSON.stringify({
-        status: 'failed',
-        error: String(error),
-        failedAt: new Date().toISOString(),
-        workerId: CONFIG.workerId,
-      })
-    );
-  } catch (err) {
-    log('error', `Failed to write error for ${correlationId}:`, err.message);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Main worker loop
-// ---------------------------------------------------------------------------
-
-const customHandlers = {};
-
-function registerHandler(name, fn) {
-  customHandlers[name] = fn;
-  log('info', `Registered custom handler: ${name}`);
-}
-
-async function pollOnce(ctx) {
-  const fullQueues = CONFIG.queues.map((q) => `${CONFIG.queuePrefix}:${q}`);
-
-  // Try priority queues first (sorted sets)
-  for (const q of fullQueues) {
-    try {
-      const tasks = await redis.zRange(q, 0, 0);
-      if (tasks.length > 0) {
-        const rawTask = tasks[0];
-        await redis.zRem(q, rawTask);
-        const task = JSON.parse(rawTask);
-
-        log('info', `Claimed task ${task.correlationId} from priority queue ${q}`);
-
-        const result = await processTask(task, ctx);
-        if (result.success) {
-          await writeResult(task.correlationId, result.result);
-        } else {
-          await writeError(task.correlationId, result.error);
-        }
-        return true;
-      }
-    } catch (err) {
-      // Ignore per-queue errors, try next
-    }
-  }
-
-  // Try normal queues with blocking pop
-  for (const q of fullQueues) {
-    try {
-      const result = await redis.brPop(q, Math.ceil(CONFIG.pollIntervalMs / 1000));
-      if (result) {
-        const task = JSON.parse(result.element);
-
-        log('info', `Claimed task ${task.correlationId} from queue ${q}`);
-
-        const procResult = await processTask(task, ctx);
-        if (procResult.success) {
-          await writeResult(task.correlationId, procResult.result);
-        } else {
-          await writeError(task.correlationId, procResult.error);
-        }
-        return true;
-      }
-    } catch (err) {
-      if (!err.message?.includes('null')) {
-        log('warn', `brpop on ${q}:`, err.message);
-      }
-    }
-  }
-
-  return false;
-}
-
-async function main() {
-  // Parse CLI args
-  const args = process.argv.slice(2);
-  for (let i = 0; i < args.length; i++) {
-    if (args[i] === '--queues' && args[i + 1]) {
-      CONFIG.queues = args[i + 1].split(',').map((s) => s.trim());
-      i++;
-    } else if (args[i] === '--worker-id' && args[i + 1]) {
-      CONFIG.workerId = args[i + 1];
-      i++;
-    } else if (args[i] === '--poll-interval' && args[i + 1]) {
-      CONFIG.pollIntervalMs = parseInt(args[i + 1], 10) * 1000;
-      i++;
-    } else if (args[i] === '--help') {
-      console.log(`
-TaskEventBus Worker
-
-Usage: node worker.js [options]
-
-Options:
-  --queues <list>      Comma-separated queue names (default: general,code,qa,research,ui)
-  --worker-id <id>     Unique worker ID (default: auto-generated)
-  --poll-interval <s>  Non-blocking poll interval in seconds (default: 3)
-  --help               Show this help
-
-Environment variables:
-  TEB_REDIS_URL        Redis URL (default: redis://redis:6379)
-  TEB_QUEUE_PREFIX     Queue prefix (default: tasks)
-  TEB_WORKER_ID        Worker ID (default: auto)
-  TEB_QUEUES           Comma-separated queues (default: general,code,qa,research,ui)
-  TEB_POLL_INTERVAL    Poll interval ms (default: 3000)
-  TEB_RESULT_TTL       Result TTL seconds (default: 300)
-
-Custom handlers:
-  Register via: registerHandler('my-handler', (payload, task) => { return { success: true, data: ... }; });
-`);
-      process.exit(0);
-    }
-  }
-
-  log('info', `Connecting to Redis: ${CONFIG.redisUrl}`);
+async function initRedis() {
+  redis = _createRedisClient({ url: CONFIG.redisUrl });
+  redis.on('error', (e) => LOG.error('[Redis]', e.message));
   await redis.connect();
-  log('info', `Connected. Worker ID: ${CONFIG.workerId}`);
-  log('info', `Listening on queues: ${CONFIG.queues.join(', ')}`);
+  LOG.info('Redis connected');
+}
 
-  const ctx = { customHandlers, CONFIG };
+async function claimTask() {
+  if (CONFIG.queues.length === 0) return null;
 
-  // Main loop
+  // 1. Try to pop from priority queue (sorted set) first
+  for (const queue of CONFIG.queues) {
+    const priorityQueue = `${CONFIG.queuePrefix}:${queue}:priority`;
+    try {
+      const result = await redis.zPopMin(priorityQueue);
+      if (result) {
+        return JSON.parse(result.value);
+      }
+    } catch (err) {
+      LOG.error(`Error claiming priority task from ${priorityQueue}:`, err.message);
+    }
+  }
+
+  // 2. Try brpop (blocking right-pop) with a short timeout on normal queues simultaneously
+  const normalQueues = CONFIG.queues.map((q) => `${CONFIG.queuePrefix}:${q}`);
+  try {
+    const result = await redis.brPop(normalQueues, 2);
+    if (result) {
+      return JSON.parse(result.element);
+    }
+  } catch (err) {
+    // Only log if it's not a timeout error
+    if (!err.message?.includes('null')) {
+      LOG.error(`Error claiming normal task:`, err.message);
+    }
+  }
+
+  return null;
+}
+
+async function writeResult(correlationId, data) {
+  const key = `${CONFIG.resultPrefix}:${correlationId}`;
+  await redis.setEx(key, CONFIG.resultTtlSeconds, JSON.stringify(data));
+}
+
+// ---------------------------------------------------------------------------
+// Main loop
+// ---------------------------------------------------------------------------
+
+async function processTask(task) {
+  const { correlationId, payload, queue } = task;
+  LOG.info(`[${correlationId}] Processing ${payload?.type ?? 'unknown'} from ${queue}`);
+
+  // Mark as processing
+  await writeResult(correlationId, {
+    status: 'processing',
+    workerId: CONFIG.workerId,
+    startedAt: new Date().toISOString(),
+  });
+
+  const handler = handlers[payload?.type];
+  if (!handler) {
+    const result = { status: 'failed', error: `Unknown custom handler: ${payload?.type}`, workerId: CONFIG.workerId };
+    await writeResult(correlationId, { ...result, completedAt: new Date().toISOString() });
+    LOG.warn(`[${correlationId}] No handler for type: ${payload?.type}`);
+    return;
+  }
+
+  try {
+    const output = await handler(payload);
+    await writeResult(correlationId, {
+      status: 'completed',
+      result: output,
+      workerId: CONFIG.workerId,
+      completedAt: new Date().toISOString(),
+    });
+    LOG.info(`[${correlationId}] Completed`);
+  } catch (err) {
+    await writeResult(correlationId, {
+      status: 'failed',
+      error: err.message,
+      workerId: CONFIG.workerId,
+      completedAt: new Date().toISOString(),
+    });
+    LOG.error(`[${correlationId}] Failed:`, err.message);
+  }
+}
+
+async function run() {
+  await initRedis();
+  LOG.info(`Listening on queues: ${CONFIG.queues.join(', ')}`);
+
   while (true) {
     try {
-      const hadTask = await pollOnce(ctx);
-      if (!hadTask) {
-        // No task available — sleep briefly before next poll
-        await new Promise((r) => setTimeout(r, CONFIG.pollIntervalMs));
+      const task = await claimTask();
+      if (task) {
+        await processTask(task);
+      } else {
+        // No task found and brPop timed out — wait pollIntervalMs if queues are empty,
+        // otherwise claimTask's block of 2s acts as the natural throttling.
+        if (CONFIG.queues.length === 0) {
+          await new Promise((r) => setTimeout(r, CONFIG.pollIntervalMs));
+        }
       }
     } catch (err) {
-      log('error', 'Poll error:', err.message);
-      await new Promise((r) => setTimeout(r, 5000));
+      LOG.error(`Error in worker loop:`, err.message);
+      await new Promise((r) => setTimeout(r, CONFIG.pollIntervalMs));
     }
   }
 }
 
-main().catch((err) => {
-  log('error', 'Worker fatal error:', err);
+// ---------------------------------------------------------------------------
+// Start
+// ---------------------------------------------------------------------------
+
+run().catch((err) => {
+  LOG.error('Worker crashed:', err);
   process.exit(1);
 });

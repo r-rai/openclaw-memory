@@ -20,7 +20,6 @@
  */
 
 import { createRequire } from 'module';
-import { createInterface } from 'readline';
 
 const _require = createRequire(import.meta.url);
 const { createClient: _createRedisClient } = _require('redis');
@@ -86,13 +85,12 @@ const handlers = {
    * Payload: { command: string, timeoutSeconds?: number }
    */
   async 'code-run'(payload) {
+    if (process.env.TEB_ALLOW_CODE_RUN !== 'true') {
+      return { success: false, error: 'code-run is disabled. Set TEB_ALLOW_CODE_RUN=true to enable.' };
+    }
     const { command, timeoutSeconds = 60 } = payload;
     return new Promise((resolve) => {
       const start = Date.now();
-      const proc = Deno.build-os === 'linux'
-        ? new (require('child_process').spawn)('/bin/sh', ['-c', command], { stdio: 'pipe' })
-        : null;
-
       // Node.js child_process
       const { spawn } = _require('child_process');
       const child = spawn('/bin/sh', ['-c', command], { stdio: 'pipe' });
@@ -129,11 +127,14 @@ const handlers = {
    * Payload: { url: string, method?: string, headers?: object, body?: string }
    */
   async 'web-fetch'(payload) {
-    const { url, method = 'GET', headers = {}, body } = payload;
+    const { url, method = 'GET', headers = {}, body, timeoutSeconds = 30 } = payload;
     const start = Date.now();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutSeconds * 1000);
     try {
-      const res = await fetch(url, { method, headers, body, redirect: 'follow' });
+      const res = await fetch(url, { method, headers, body, redirect: 'follow', signal: controller.signal });
       const text = await res.text();
+      clearTimeout(timer);
       return {
         success: true,
         status: res.status,
@@ -143,7 +144,9 @@ const handlers = {
         durationMs: Date.now() - start,
       };
     } catch (err) {
-      return { success: false, error: err.message, durationMs: Date.now() - start };
+      clearTimeout(timer);
+      const isTimeout = err.name === 'AbortError';
+      return { success: false, error: isTimeout ? 'TIMEOUT' : err.message, timedOut: isTimeout, durationMs: Date.now() - start };
     }
   },
 
@@ -178,29 +181,42 @@ async function initRedis() {
   LOG.info('Redis connected');
 }
 
-async function claimTask(queue) {
-  const fullQueue = `${CONFIG.queuePrefix}:${queue}`;
+async function claimTask() {
+  if (CONFIG.queues.length === 0) return null;
 
-  // Try brpop (blocking right-pop) with a short timeout
-  const result = await redis.brPop(fullQueue, 3);
-  if (!result) return null;
-
-  try {
-    return JSON.parse(result.element);
-  } catch {
-    LOG.warn(`Invalid JSON in queue ${fullQueue}: ${result.element.slice(0, 100)}`);
-    return null;
+  // 1. Try to pop from priority queue (sorted set) first
+  for (const queue of CONFIG.queues) {
+    const priorityQueue = `${CONFIG.queuePrefix}:${queue}:priority`;
+    try {
+      const result = await redis.zPopMin(priorityQueue);
+      if (result) {
+        return JSON.parse(result.value);
+      }
+    } catch (err) {
+      LOG.error(`Error claiming priority task from ${priorityQueue}:`, err.message);
+    }
   }
+
+  // 2. Try brpop (blocking right-pop) with a short timeout on normal queues simultaneously
+  const normalQueues = CONFIG.queues.map((q) => `${CONFIG.queuePrefix}:${q}`);
+  try {
+    const result = await redis.brPop(normalQueues, 2);
+    if (result) {
+      return JSON.parse(result.element);
+    }
+  } catch (err) {
+    // Only log if it's not a timeout error
+    if (!err.message?.includes('null')) {
+      LOG.error(`Error claiming normal task:`, err.message);
+    }
+  }
+
+  return null;
 }
 
 async function writeResult(correlationId, data) {
   const key = `${CONFIG.resultPrefix}:${correlationId}`;
   await redis.setEx(key, CONFIG.resultTtlSeconds, JSON.stringify(data));
-}
-
-async function publishEvent(channel, payload) {
-  const fullChannel = `teb:${channel}`;
-  await redis.publish(fullChannel, JSON.stringify({ ...payload, workerId: CONFIG.workerId }));
 }
 
 // ---------------------------------------------------------------------------
@@ -251,27 +267,19 @@ async function run() {
   LOG.info(`Listening on queues: ${CONFIG.queues.join(', ')}`);
 
   while (true) {
-    let task = null;
-    let worked = false;
-
-    // Try each queue in round-robin fashion
-    for (const queue of CONFIG.queues) {
-      try {
-        const claimed = await claimTask(queue);
-        if (claimed) {
-          task = claimed;
-          // Process synchronously to avoid concurrent result overwrites
-          await processTask(task);
-          worked = true;
-          break;
+    try {
+      const task = await claimTask();
+      if (task) {
+        await processTask(task);
+      } else {
+        // No task found and brPop timed out — wait pollIntervalMs if queues are empty,
+        // otherwise claimTask's block of 2s acts as the natural throttling.
+        if (CONFIG.queues.length === 0) {
+          await new Promise((r) => setTimeout(r, CONFIG.pollIntervalMs));
         }
-      } catch (err) {
-        LOG.error(`Error claiming from ${queue}:`, err.message);
       }
-    }
-
-    if (!worked) {
-      // All queues empty — wait before next poll
+    } catch (err) {
+      LOG.error(`Error in worker loop:`, err.message);
       await new Promise((r) => setTimeout(r, CONFIG.pollIntervalMs));
     }
   }

@@ -6,45 +6,74 @@
  *  - COLD → Qdrant       (semantic vector search, long-term memory)
  *  - embedding → llama.cpp (nomic-embed-text-v1.5, 768-dim)
  *
- * Supplies memory_search + memory_get + memory_store + memory_cache_update tools.
+ * Supplies: memory_search, memory_get, memory_store, memory_cache_update
  */
 
 import { createRequire } from 'module';
-import { defineToolPlugin } from '/app/node_modules/openclaw/dist/plugin-sdk/tool-plugin.js';
+import crypto from 'crypto';
 
 // ---------------------------------------------------------------------------
-// Redis + Qdrant (CommonJS packages, loaded via createRequire)
+// Resolve CJS packages relative to this file's location
+// (works in both local dev and inside OpenClaw container node_modules)
 // ---------------------------------------------------------------------------
 const _require = createRequire(import.meta.url);
 
-const { createClient: _createRedisClient } = _require(
-  '/home/node/.openclaw/plugins/MultiTierMemory/node_modules/redis/dist/index.js'
-);
-
-const { QdrantClient } = _require(
-  '/home/node/.openclaw/plugins/MultiTierMemory/node_modules/@qdrant/js-client-rest/dist/cjs/index.js'
-);
+const { createClient: _createRedisClient } = _require('redis');
+const { QdrantClient } = _require('@qdrant/js-client-rest');
 
 // ---------------------------------------------------------------------------
-// Config schema
+// Config — keys map to openclaw.json plugin config
 // ---------------------------------------------------------------------------
 
 const ConfigSchema = {
   type: 'object',
   additionalProperties: false,
   properties: {
-    redisUrl: { type: 'string', default: 'redis://redis:6379' },
-    qdrantUrl: { type: 'string', default: 'http://qdrant:6333' },
-    embeddingUrl: { type: 'string', default: 'http://llama-cpp:8080/v1' },
-    embeddingModel: { type: 'string', default: 'nomic-embed-text-v1.5' },
-    vectorSize: { type: 'integer', default: 768 },
-    hotTtlSeconds: { type: 'integer', default: 3600 },
-    coldCollection: { type: 'string', default: 'agent_memory' },
+    redisUrl: {
+      type: 'string',
+      default: 'redis://redis:6379',
+      description: 'Redis connection URL (hot cache + pub/sub)',
+    },
+    qdrantUrl: {
+      type: 'string',
+      default: 'http://qdrant:6333',
+      description: 'Qdrant HTTP URL (cold vector storage)',
+    },
+    embeddingUrl: {
+      type: 'string',
+      default: 'http://llama-cpp:8080/v1',
+      description: 'llama.cpp embeddings API base URL',
+    },
+    embeddingModel: {
+      type: 'string',
+      default: 'nomic-embed-text-v1.5.Q4_K_M.gguf',
+      description: 'Model name passed to /v1/embeddings',
+    },
+    vectorSize: {
+      type: 'integer',
+      default: 768,
+      description: 'Embedding dimensionality (must match your model)',
+    },
+    hotTtlSeconds: {
+      type: 'integer',
+      default: 3600,
+      description: 'How long hot-cache entries live in Redis (seconds)',
+    },
+    coldCollection: {
+      type: 'string',
+      default: 'agent_memory',
+      description: 'Qdrant collection name for cold-tier vectors',
+    },
+    hotKeyPrefix: {
+      type: 'string',
+      default: 'mtm:hot',
+      description: 'Redis key prefix for hot-cache entries (change to avoid collisions on shared Redis)',
+    },
   },
 };
 
 // ---------------------------------------------------------------------------
-// Tool schemas
+// Tool schemas (TypeBox-compatible plain objects)
 // ---------------------------------------------------------------------------
 
 const MemorySearchSchema = {
@@ -52,11 +81,24 @@ const MemorySearchSchema = {
   properties: {
     query: {
       type: 'string',
-      description: 'Search query — describe what you want to recall from memory.',
+      description: 'Natural-language search query — describe what you want to recall',
     },
-    maxResults: { type: 'integer', minimum: 1, default: 10 },
-    minScore: { type: 'number', minimum: 0, maximum: 1 },
-    agentId: { type: 'string', description: 'Agent ID to scope the search.' },
+    maxResults: {
+      type: 'integer',
+      minimum: 1,
+      default: 10,
+      description: 'Maximum number of results to return',
+    },
+    minScore: {
+      type: 'number',
+      minimum: 0,
+      maximum: 1,
+      description: 'Minimum cosine-similarity score threshold',
+    },
+    agentId: {
+      type: 'string',
+      description: 'Agent ID to scope the search (filters to that agent\'s memories)',
+    },
   },
   required: ['query'],
   additionalProperties: false,
@@ -67,11 +109,22 @@ const MemoryGetSchema = {
   properties: {
     path: {
       type: 'string',
-      description: 'Memory file path to read (e.g. MEMORY.md, memory/2026-06-14.md).',
+      description: 'Memory file path to read (e.g. MEMORY.md, memory/2026-06-14.md)',
     },
-    from: { type: 'integer', minimum: 1, description: 'Start line number.' },
-    lines: { type: 'integer', minimum: 1, description: 'Max lines to return.' },
-    agentId: { type: 'string' },
+    from: {
+      type: 'integer',
+      minimum: 1,
+      description: 'Start reading from this line number (1-indexed)',
+    },
+    lines: {
+      type: 'integer',
+      minimum: 1,
+      description: 'Maximum number of lines to read',
+    },
+    agentId: {
+      type: 'string',
+      description: 'Agent ID to scope the read (required for agent-specific memories)',
+    },
   },
   required: ['path'],
   additionalProperties: false,
@@ -80,489 +133,412 @@ const MemoryGetSchema = {
 const MemoryStoreSchema = {
   type: 'object',
   properties: {
-    text: {
+    path: {
       type: 'string',
-      description: 'The memory or fact to store. Be specific and concise.',
+      description: 'Path/key for this memory entry (e.g. memory/2026-06-14.md)',
     },
-    collectionType: {
+    content: {
       type: 'string',
-      enum: ['observations', 'knowledge', 'episodes'],
-      default: 'observations',
-      description:
-        'observations = facts learned, knowledge = persistent truths, episodes = conversation turns',
+      description: 'Content to store',
     },
     importance: {
       type: 'number',
       minimum: 0,
       maximum: 1,
       default: 0.5,
-      description:
-        'Importance score 0-1. Higher scores survive longer in hot cache and rank higher in search.',
+      description: 'Importance score; entries >= 0.7 are auto-cached to cold tier',
     },
-    tags: {
-      type: 'array',
-      items: { type: 'string' },
-      description: 'Optional tags to attach for filtering.',
+    agentId: {
+      type: 'string',
+      description: 'Agent ID this memory belongs to',
     },
-    agentId: { type: 'string', description: 'Agent ID that owns this memory.' },
+    metadata: {
+      type: 'object',
+      description: 'Arbitrary metadata to attach (tags, timestamps, etc.)',
+    },
   },
-  required: ['text'],
+  required: ['path', 'content'],
   additionalProperties: false,
 };
 
 const MemoryCacheUpdateSchema = {
   type: 'object',
   properties: {
-    key: {
+    path: {
       type: 'string',
-      description:
-        'Cache key within the hot layer, e.g. "active-project", "current-task", "user-preferences".',
+      description: 'Memory path/key to update the cache TTL for',
     },
-    data: {
-      type: 'object',
-      description: 'JSON-serializable data to cache.',
-    },
-    ttlSeconds: {
+    hotTtlSeconds: {
       type: 'integer',
-      minimum: 60,
-      default: 3600,
-      description: 'Time-to-live in seconds. Minimum 60.',
+      minimum: 1,
+      description: 'New TTL for the Redis hot-cache entry',
     },
-    agentId: { type: 'string', description: 'Agent ID.' },
+    agentId: {
+      type: 'string',
+      description: 'Agent ID',
+    },
   },
-  required: ['key', 'data'],
+  required: ['path'],
   additionalProperties: false,
 };
 
 // ---------------------------------------------------------------------------
-// MultiTierMemoryManager
+// Plugin class
 // ---------------------------------------------------------------------------
 
-class MultiTierMemoryManager {
-  constructor(config = {}) {
+class MultiTierMemoryPlugin {
+  constructor(config) {
     this.redisUrl = config.redisUrl ?? 'redis://redis:6379';
     this.qdrantUrl = config.qdrantUrl ?? 'http://qdrant:6333';
     this.embeddingUrl = config.embeddingUrl ?? 'http://llama-cpp:8080/v1';
-    this.embeddingModel = config.embeddingModel ?? 'nomic-embed-text-v1.5';
+    this.embeddingModel = config.embeddingModel ?? 'nomic-embed-text-v1.5.Q4_K_M.gguf';
     this.vectorSize = config.vectorSize ?? 768;
     this.hotTtlSeconds = config.hotTtlSeconds ?? 3600;
     this.coldCollection = config.coldCollection ?? 'agent_memory';
+    this.hotKeyPrefix = config.hotKeyPrefix ?? 'mtm:hot';
 
-    this.redis = _createRedisClient({ url: this.redisUrl });
-    this.qdrant = new QdrantClient({ url: this.qdrantUrl });
-    this.redisConnected = false;
+    /** @type {import('redis').RedisClientType | null} */
+    this._redis = null;
+    /** @type {QdrantClient | null} */
+    this._qdrant = null;
+    this._embedUrl = `${this.embeddingUrl}/embeddings`;
+    /** @type {Promise<void> | null} — promise lock to prevent concurrent collection creation */
+    this._coldInitPromise = null;
   }
 
-  async init() {
-    try {
-      await this.redis.connect();
-      this.redisConnected = true;
-      console.log('[MultiTierMemory] Redis connected (hot layer)');
-    } catch (err) {
-      console.warn(
-        '[MultiTierMemory] Redis connection failed — hot layer disabled:',
-        err?.message ?? err
-      );
-      this.redisConnected = false;
-    }
+  // ── Redis ──────────────────────────────────────────────────────────────
 
-    try {
-      await this.ensureCollection();
-      console.log('[MultiTierMemory] Qdrant ready (cold layer)');
-    } catch (err) {
-      console.warn(
-        '[MultiTierMemory] Qdrant collection check failed:',
-        err?.message ?? err
-      );
+  async _getRedis() {
+    if (!this._redis) {
+      this._redis = _createRedisClient({ url: this.redisUrl });
+      this._redis.on('error', (err) => console.error('[MTM Redis]', err.message));
+      await this._redis.connect();
     }
+    return this._redis;
   }
 
-  async ensureCollection() {
-    try {
-      const exists = await this.qdrant.collectionExists(this.coldCollection);
-      if (!exists.exists) {
-        await this.qdrant.createCollection(this.coldCollection, {
-          vectors: { size: this.vectorSize, distance: 'Cosine' },
-        });
-        console.log(
-          `[MultiTierMemory] Created Qdrant collection: ${this.coldCollection}`
-        );
-      }
-    } catch {
-      // Already exists — safe to ignore
-    }
+  async _hotGet(agentId, key) {
+    const redis = await this._getRedis();
+    return redis.get(`${this.hotKeyPrefix}:${agentId}:${key}`);
   }
 
-  // -------------------------------------------------------------------------
-  // Embedding (llama.cpp)
-  // -------------------------------------------------------------------------
+  async _hotSet(agentId, key, value, ttlSeconds) {
+    const redis = await this._getRedis();
+    await redis.setEx(`${this.hotKeyPrefix}:${agentId}:${key}`, ttlSeconds, value);
+  }
 
-  async embed(text) {
-    const res = await fetch(`${this.embeddingUrl}/embeddings`, {
+  async _hotDel(agentId, key) {
+    const redis = await this._getRedis();
+    await redis.del(`${this.hotKeyPrefix}:${agentId}:${key}`);
+  }
+
+  // ── Embeddings ─────────────────────────────────────────────────────────
+
+  async _embed(text) {
+    const res = await fetch(this._embedUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ input: text, model: this.embeddingModel }),
     });
-    if (!res.ok) {
-      throw new Error(
-        `Embedding request failed: ${res.status} ${res.statusText}`
-      );
-    }
+    if (!res.ok) throw new Error(`Embedding API error: ${res.status} ${res.statusText}`);
     const data = await res.json();
-    return data.data?.[0]?.embedding ?? [];
+    return data.data?.[0]?.embedding ?? null;
   }
 
-  // -------------------------------------------------------------------------
-  // Hot layer (Redis)
-  // -------------------------------------------------------------------------
+  // ── Qdrant ─────────────────────────────────────────────────────────────
 
-  /**
-   * Write to the Redis hot cache.
-   * Higher importance → longer effective TTL in practice (agents should respect it).
-   */
-  async cachePut(key, agentId, data, ttlSeconds) {
-    if (!this.redisConnected) return false;
-    const ttl = Math.max(ttlSeconds ?? this.hotTtlSeconds, 60);
-    const cacheKey = `mtm:hot:${agentId}:${key}`;
-    await this.redis.setEx(cacheKey, ttl, JSON.stringify(data));
-    return true;
+  async _getQdrant() {
+    if (!this._qdrant) {
+      this._qdrant = new QdrantClient({ url: this.qdrantUrl });
+    }
+    return this._qdrant;
   }
 
-  /**
-   * Read from the Redis hot cache.
-   */
-  async cacheGet(key, agentId) {
-    if (!this.redisConnected) return null;
-    const cacheKey = `mtm:hot:${agentId}:${key}`;
-    const data = await this.redis.get(cacheKey);
-    return data ? JSON.parse(data) : null;
+  async _ensureColdCollection() {
+    // Promise-based lock: all concurrent callers await the same init promise
+    if (!this._coldInitPromise) {
+      this._coldInitPromise = (async () => {
+        const q = await this._getQdrant();
+        try {
+          await q.getCollection(this.coldCollection);
+        } catch {
+          // Collection doesn't exist — create it
+          await q.createCollection(this.coldCollection, {
+            vectors: { size: this.vectorSize, distance: 'Cosine' },
+          });
+          console.log(`[MTM] Created Qdrant collection: ${this.coldCollection}`);
+        }
+      })();
+    }
+    return this._coldInitPromise;
   }
 
-  /**
-   * Invalidate a hot cache entry.
-   */
-  async cacheInvalidate(key, agentId) {
-    if (!this.redisConnected) return false;
-    const cacheKey = `mtm:hot:${agentId}:${key}`;
-    await this.redis.del(cacheKey);
-    return true;
+  async _coldSearch(embedding, limit, minScore, agentId) {
+    await this._ensureColdCollection();
+    const q = await this._getQdrant();
+    const filter = agentId ? { must: [{ key: 'agentId', match: { value: agentId } }] } : undefined;
+    const results = await q.search(this.coldCollection, {
+      vector: embedding,
+      limit,
+      score_threshold: minScore,
+      filter,
+      with_payload: true,
+    });
+    return results.map((r) => ({
+      id: r.id,
+      score: r.score,
+      path: r.payload?.path,
+      content: r.payload?.content,
+      importance: r.payload?.importance,
+      agentId: r.payload?.agentId,
+      metadata: r.payload?.metadata,
+    }));
   }
 
-  /**
-   * List all hot cache keys for an agent (useful for debugging).
-   */
-  async cacheKeys(agentId) {
-    if (!this.redisConnected) return [];
-    const pattern = `mtm:hot:${agentId}:*`;
-    const keys = await this.redis.keys(pattern);
-    return keys.map((k) => k.replace(`mtm:hot:${agentId}:`, ''));
+  _generateDeterministicUuid(agentId, path) {
+    const hash = crypto.createHash('md5').update(`${agentId}:${path}`).digest('hex');
+    return `${hash.slice(0, 8)}-${hash.slice(8, 12)}-${hash.slice(12, 16)}-${hash.slice(16, 20)}-${hash.slice(20, 32)}`;
   }
 
-  // -------------------------------------------------------------------------
-  // Cold layer (Qdrant)
-  // -------------------------------------------------------------------------
-
-  async retrieveRelevant(query, agentId, limit = 10) {
-    try {
-      const vector = await this.embed(query);
-      const results = await this.qdrant.search(this.coldCollection, {
-        vector,
-        limit,
-        filter: {
-          must: [{ key: 'agentId', match: { value: agentId } }],
+  async _coldUpsert(agentId, key, content, embedding, importance, metadata) {
+    await this._ensureColdCollection();
+    const q = await this._getQdrant();
+    const id = this._generateDeterministicUuid(agentId, key);
+    await q.upsert(this.coldCollection, {
+      wait: true,
+      points: [
+        {
+          id,
+          vector: embedding,
+          payload: { path: key, content, importance, agentId, metadata, storedAt: new Date().toISOString() },
         },
-      });
+      ],
+    });
+  }
 
-      return results.map((point) => ({
-        id: String(point.id),
-        text: point.payload?.text ?? '',
-        score: point.score ?? 0,
-        metadata: point.payload ?? {},
-      }));
+  // ── Tool implementations ─────────────────────────────────────────────────
+
+  async memory_search({ query, maxResults = 10, minScore = 0.0, agentId } = {}) {
+    try {
+      // Get query embedding
+      const embedding = await this._embed(query);
+      if (!embedding) throw new Error('Failed to generate embedding for query');
+
+      // Search cold tier (Qdrant) — primary semantic search
+      const coldResults = await this._coldSearch(embedding, maxResults, minScore, agentId);
+
+      // Also check hot tier (Redis) for recent entries
+      const redis = await this._getRedis();
+      let hotItems = [];
+      const prefixPattern = `${this.hotKeyPrefix}:`;
+      const scanPattern = agentId ? `${this.hotKeyPrefix}:${agentId}:*` : `${this.hotKeyPrefix}:*`;
+
+      // Scan for matching hot keys
+      const keys = [];
+      for await (const key of redis.scanIterator({ MATCH: scanPattern, COUNT: 100 })) {
+        keys.push(key);
+        if (keys.length >= 20) break;
+      }
+
+      // Batch fetch all values in a single round-trip
+      if (keys.length > 0) {
+        const values = await redis.mGet(keys);
+        for (let i = 0; i < keys.length; i++) {
+          const v = values[i];
+          if (!v) continue;
+          try {
+            const item = JSON.parse(v);
+            // Light text match against query
+            if (item.content && query.toLowerCase().split(' ').some((w) => item.content.toLowerCase().includes(w))) {
+              const parts = keys[i].substring(prefixPattern.length).split(':');
+              const itemAgentId = parts[0];
+              const path = parts.slice(1).join(':');
+              hotItems.push({ source: 'hot', score: 0.95, path, agentId: itemAgentId, ...item });
+            }
+          } catch {
+            // not JSON, skip
+          }
+        }
+      }
+
+      // Deduplicate: prefer cold results, add hot items not already present
+      const coldPaths = new Set(coldResults.map((r) => r.path));
+      const uniqueHot = hotItems.filter((h) => !coldPaths.has(h.path));
+
+      return {
+        query,
+        hotCount: uniqueHot.length,
+        coldCount: coldResults.length,
+        results: [...uniqueHot, ...coldResults].slice(0, maxResults),
+      };
     } catch (err) {
-      console.error(
-        '[MultiTierMemory] Qdrant search failed:',
-        err?.message ?? err
-      );
-      return [];
+      return { error: err.message, query, results: [] };
     }
   }
 
-  /**
-   * Store a memory entry in Qdrant (async, non-blocking).
-   * Returns the generated memory ID immediately so the caller can reference it.
-   */
-  async storeMemoryText(
-    agentId,
-    text,
-    collectionType = 'observations',
-    importance = 0.5,
-    tags = []
-  ) {
-    const id = globalThis.crypto?.randomUUID?.() ?? `mtm-${Date.now()}`;
-
-    setImmediate(async () => {
-      try {
-        const vector = await this.embed(text);
-        await this.qdrant.upsert(this.coldCollection, {
-          wait: true,
-          points: [
-            {
-              id,
-              vector,
-              payload: {
-                text,
-                agentId,
-                collectionType,
-                importance,
-                tags,
-                createdAt: new Date().toISOString(),
-              },
-            },
-          ],
-        });
-      } catch (err) {
-        console.error(
-          '[MultiTierMemory] Background store failed:',
-          err?.message ?? err
-        );
+  async memory_get({ path, from, lines, agentId } = {}) {
+    try {
+      // Check hot cache first
+      if (agentId) {
+        const cached = await this._hotGet(agentId, path);
+        if (cached) {
+          const item = JSON.parse(cached);
+          return { path, source: 'hot', content: item.content, metadata: item.metadata };
+        }
       }
-    });
 
-    return id;
+      // Fall back to cold search for this specific path
+      await this._ensureColdCollection();
+      const q = await this._getQdrant();
+      const filter = {
+        must: [
+          { key: 'path', match: { value: path } },
+          ...(agentId ? [{ key: 'agentId', match: { value: agentId } }] : []),
+        ],
+      };
+      
+      const response = await q.scroll(this.coldCollection, {
+        filter,
+        limit: 1,
+        with_payload: true,
+        with_vector: false
+      });
+      const results = response.points || [];
+
+      if (!results.length) return { error: 'Memory not found', path };
+
+      const hit = results[0].payload;
+      let content = hit.content ?? '';
+
+      // Apply line range if specified
+      if (from || lines) {
+        const allLines = content.split('\n');
+        const start = Math.max(0, (from ?? 1) - 1);
+        const end = lines ? start + lines : allLines.length;
+        content = allLines.slice(start, end).join('\n');
+      }
+
+      return { path, source: 'cold', content, importance: hit.importance, metadata: hit.metadata };
+    } catch (err) {
+      return { error: err.message, path };
+    }
   }
 
-  buildMemoryGetResult(path) {
-    return {
-      path,
-      text: '',
-      source: 'multi-tier-memory',
-    };
+  async memory_store({ path, content, importance = 0.5, agentId, metadata = {} } = {}) {
+    if (!agentId) return { error: 'agentId is required for memory_store' };
+    try {
+      // Always write to hot cache
+      await this._hotSet(agentId, path, JSON.stringify({ content, importance, metadata }), this.hotTtlSeconds);
+
+      // Auto-cache important items to cold tier too
+      if (importance >= 0.7) {
+        const embedding = await this._embed(content);
+        if (embedding) {
+          await this._coldUpsert(agentId, path, content, embedding, importance, metadata);
+        }
+      }
+
+      return { path, stored: true, hotCached: true, coldCached: importance >= 0.7 };
+    } catch (err) {
+      return { error: err.message, path };
+    }
+  }
+
+  async memory_cache_update({ path, hotTtlSeconds, agentId } = {}) {
+    try {
+      if (!agentId) return { error: 'agentId is required' };
+
+      const redis = await this._getRedis();
+      const key = `${this.hotKeyPrefix}:${agentId}:${path}`;
+      const existing = await redis.get(key);
+
+      if (!existing) return { path, updated: false, error: 'Hot cache entry not found' };
+
+      const ttl = hotTtlSeconds ?? this.hotTtlSeconds;
+      await redis.setEx(key, ttl, existing);
+
+      return { path, updated: true, hotTtlSeconds: ttl };
+    } catch (err) {
+      return { error: err.message, path };
+    }
+  }
+
+  // ── Lifecycle ──────────────────────────────────────────────────────────
+
+  async initialize() {
+    // Warm connections
+    await Promise.all([this._getRedis(), this._getQdrant()]);
+    await this._ensureColdCollection();
+    console.log('[MultiTierMemory] Initialized');
+  }
+
+  async destroy() {
+    if (this._redis) {
+      await this._redis.quit();
+      this._redis = null;
+    }
   }
 }
 
 // ---------------------------------------------------------------------------
-// Module-level singleton (one manager per gateway process)
+// Plugin registration
 // ---------------------------------------------------------------------------
 
-let _manager = null;
-
-function getManager(config = {}) {
-  if (!_manager) {
-    _manager = new MultiTierMemoryManager(config);
-    _manager.init().catch((err) =>
-      console.error('[MultiTierMemory] init error:', err)
-    );
+let _plugin = null;
+function getPlugin(config) {
+  if (!_plugin) {
+    _plugin = new MultiTierMemoryPlugin(config);
+    _plugin.initialize().catch((err) => console.error('[MTM Initialize Error]', err));
+  } else {
+    // Config is frozen at first init — restart OpenClaw to apply config changes
+    console.warn('[MTM] Config update ignored — plugin already initialized. Restart to apply changes.');
   }
-  return _manager;
+  return _plugin;
 }
 
-// ---------------------------------------------------------------------------
-// Plugin entry point
-// ---------------------------------------------------------------------------
+import { defineToolPlugin } from 'openclaw/plugin-sdk/tool-plugin';
 
-const plugin = defineToolPlugin({
+export default defineToolPlugin({
   id: 'multi-tier-memory',
   name: 'Multi-Tier Memory',
-  description:
-    'Three-tier memory plugin: Redis hot-cache + Qdrant cold vectors + llama.cpp embeddings. ' +
-    'Handles memory_search (semantic recall), memory_store (persist facts), memory_cache_update (hot cache), and memory_get (file reads).',
-
+  description: 'Three-tier memory system: Redis (hot) + Qdrant (cold) + llama.cpp embeddings',
   configSchema: ConfigSchema,
-
   tools: (tool) => [
-    // ── memory_search ──────────────────────────────────────────────────────
     tool({
       name: 'memory_search',
       label: 'Memory Search',
-      description:
-        'Mandatory recall step: semantically search agent memory before answering ' +
-        'questions about prior work, decisions, dates, people, preferences, or todos. ' +
-        'Queries the Redis hot cache first, then falls back to Qdrant vector search.',
-
+      description: 'Semantic memory search across hot (Redis) and cold (Qdrant) tiers',
       parameters: MemorySearchSchema,
-
-      async execute(params, config) {
-        const mgr = getManager(config ?? {});
-        const agentId = params.agentId ?? 'default';
-        const maxResults = params.maxResults ?? 10;
-        const minScore = params.minScore ?? 0;
-        const searchStart = Date.now();
-
-        // Hot cache first (fast path for active context)
-        const hotKeys = await mgr.cacheKeys(agentId);
-        const hotHits = [];
-        for (const key of hotKeys.slice(0, 5)) {
-          const data = await mgr.cacheGet(key, agentId);
-          if (data) {
-            hotHits.push({
-              path: `memory://hot:${key}`,
-              text: JSON.stringify(data),
-              score: 0.97,
-              source: 'multi-tier-memory',
-              startLine: 1,
-              endLine: JSON.stringify(data).split('\n').length,
-              metadata: { tier: 'hot', key },
-            });
-          }
-        }
-
-        // Cold search (Qdrant vector search)
-        const coldResults = await mgr.retrieveRelevant(
-          params.query,
-          agentId,
-          maxResults
-        );
-        const searchMs = Date.now() - searchStart;
-
-        const results = [
-          ...hotHits,
-          ...coldResults
-            .filter((r) => r.score >= minScore)
-            .slice(0, maxResults)
-            .map((r) => ({
-              path: `memory://${r.id}`,
-              text: r.text,
-              score: r.score,
-              source: 'multi-tier-memory',
-              startLine: 1,
-              endLine: r.text.split('\n').length,
-              metadata: r.metadata,
-            })),
-        ];
-
-        return {
-          results,
-          provider: 'multi-tier-memory',
-          model: mgr.embeddingModel,
-          fallback: null,
-          citations: false,
-          mode: hotHits.length ? 'hot+vector' : 'vector-only',
-          debug: {
-            backend: 'multi-tier-memory',
-            searchMs,
-            hits: results.length,
-            hotCacheHits: hotHits.length,
-            coldHits: coldResults.length,
-          },
-        };
-      },
+      execute(params, config, context) {
+        return getPlugin(config).memory_search(params);
+      }
     }),
-
-    // ── memory_get ─────────────────────────────────────────────────────────
     tool({
       name: 'memory_get',
       label: 'Memory Get',
-      description:
-        'Read a specific memory file by path. ' +
-        'Handles MEMORY.md, memory/*.md files, and daily journal entries.',
-
+      description: 'Read a specific memory entry by path',
       parameters: MemoryGetSchema,
-
-      async execute(params, config) {
-        const mgr = getManager(config ?? {});
-        const result = mgr.buildMemoryGetResult(params.path);
-        return {
-          path: result.path,
-          text: result.text,
-          source: result.source,
-          disabled: false,
-        };
-      },
+      execute(params, config, context) {
+        return getPlugin(config).memory_get(params);
+      }
     }),
-
-    // ── memory_store ───────────────────────────────────────────────────────
     tool({
       name: 'memory_store',
       label: 'Memory Store',
-      description:
-        'Persist an important fact, observation, or decision into the cold memory layer. ' +
-        'Use when you learn something worth remembering — a decision made, a preference ' +
-        'expressed, a fact stated, or a lesson learned. ' +
-        'Higher importance scores (0.5-1.0) are recommended for facts that should rank ' +
-        'higher in future searches and survive longer.',
-
+      description: 'Store a memory entry (auto-caches important items to cold tier)',
       parameters: MemoryStoreSchema,
-
-      async execute(params, config) {
-        const mgr = getManager(config ?? {});
-        const agentId = params.agentId ?? 'default';
-        const collectionType = params.collectionType ?? 'observations';
-        const importance = params.importance ?? 0.5;
-        const tags = params.tags ?? [];
-
-        const id = await mgr.storeMemoryText(
-          agentId,
-          params.text,
-          collectionType,
-          importance,
-          tags
-        );
-
-        // Also cache high-importance items in hot layer
-        if (importance >= 0.7 && mgr.redisConnected) {
-          await mgr.cachePut(
-            `importance:${id}`,
-            agentId,
-            { text: params.text, collectionType, importance, tags },
-            Math.round((importance * mgr.hotTtlSeconds) / 2)
-          );
-        }
-
-        return {
-          id,
-          stored: true,
-          collectionType,
-          importance,
-          tags,
-          agentId,
-          note: importance >= 0.7
-            ? 'Also cached in hot layer (importance >= 0.7)'
-            : 'Stored in cold layer only. Use importance >= 0.7 to also cache hot.',
-        };
-      },
+      execute(params, config, context) {
+        return getPlugin(config).memory_store(params);
+      }
     }),
-
-    // ── memory_cache_update ────────────────────────────────────────────────
     tool({
       name: 'memory_cache_update',
       label: 'Memory Cache Update',
-      description:
-        'Update the Redis hot cache with active context — current task state, user ' +
-        'preferences, working data, or anything that should be retrieved fast in the ' +
-        'next few minutes/hours. ' +
-        'Use for ephemeral working state (not persistent facts). ' +
-        'Call this after completing significant steps so the next memory_search ' +
-        'picks up the hot context immediately without a cold Qdrant round-trip.',
-
+      description: 'Update the TTL of a hot-cache entry in Redis',
       parameters: MemoryCacheUpdateSchema,
-
-      async execute(params, config) {
-        const mgr = getManager(config ?? {});
-        const agentId = params.agentId ?? 'default';
-        const ttl = Math.max(params.ttlSeconds ?? mgr.hotTtlSeconds, 60);
-
-        const ok = await mgr.cachePut(params.key, agentId, params.data, ttl);
-
-        if (!ok) {
-          return {
-            stored: false,
-            key: params.key,
-            note: 'Redis unavailable — hot cache write skipped. Data NOT persisted.',
-            hotLayer: false,
-          };
-        }
-
-        return {
-          stored: true,
-          key: params.key,
-          ttlSeconds: ttl,
-          hotLayer: true,
-          note: `Cached in Redis hot layer for ${ttl}s. Will appear in memory_search immediately.`,
-        };
-      },
+      execute(params, config, context) {
+        return getPlugin(config).memory_cache_update(params);
+      }
     }),
-  ],
+  ]
 });
-
-export default plugin;
